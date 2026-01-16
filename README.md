@@ -34,28 +34,28 @@ Implementation of **Zero Trust Architecture (ZTA)** with **Hub-and-Spoke** netwo
 ### Network Topology
 
 ```
-                       ┌─────────────────┐
-                       │    INTERNET     │
-                       └────────┬────────┘
-                                │
-                    ┌───────────┴────────────┐
-                    │                        │                     
-                    ▼                        ▼                      
-     ┌──────────────────────────┐  ┌─────────────────────────────────────────┐
-     │   DMZ (10.50.1.0/24)     │  │      Observability (10.40.1.0/24)       │
-     │   ══════════════════     │  │      ═══════════════════════════        │
-     │                          │  │                                         │
-     │  ┌────────────────────┐  │  │  ┌─────────────────┐  ┌──────────────┐  │
-     │  │   AUTH PORTAL ★    │  │  │  │  vm-monitoring  │  │ vm-identity  │  │
-     │  │  172.10.10.170     │  │  │  │  10.40.1.10     │  │  10.40.1.20  │  │
-     │  │  (THE ONLY PUBLIC) │  │  │  │  (NO public IP) │  │              │  │
-     │  │                    │  │  │  │                 │  │              │  │
-     │  │  • Login UI (:80)  │  │  │  │  • Prometheus   │  │ • SPIRE      │  │
-     │  │  • JWT API (:8888) │  │  │  │  • Grafana      │  │   Server     │  │
-     │  │  • WireGuard Hub   │  │  │  │  • Jaeger       │  │   (:8081)    │  │
-     │  │    (10.99.0.100)   │  │  │  └─────────────────┘  └──────────────┘  │
-     │  └────────────────────┘  │  │                                         │
-     └──────────────────────────┘  └─────────────────────────────────────────┘
+         ┌─────────────────┐
+         │    INTERNET     │
+         └────────┬────────┘
+                  │
+                  │
+                  │                                            
+                  ▼                                             
+     ┌──────────────────────────┐       ┌─────────────────────────────────────────┐
+     │   DMZ (10.50.1.0/24)     │       │      Observability (10.40.1.0/24)       │
+     │   ══════════════════     │       │      ═══════════════════════════        │
+     │                          │       │                                         │
+     │  ┌────────────────────┐  │       │  ┌─────────────────┐  ┌──────────────┐  │
+     │  │   AUTH PORTAL ★    │  │       │  │  vm-monitoring  │  │ vm-identity  │  │
+     │  │  172.10.10.170     │  │       │  │  10.40.1.10     │  │  10.40.1.20  │  │
+     │  │  (THE ONLY PUBLIC) │  │       │  │  (NO public IP) │  │              │  │
+     │  │                    │  │──────►│  │                 │  │              │  │
+     │  │  • Login UI (:80)  │  │       │  │  • Prometheus   │  │ • SPIRE      │  │
+     │  │  • JWT API (:8888) │  │       │  │  • Grafana      │  │   Server     │  │
+     │  │  • WireGuard Hub   │  │       │  │  • Jaeger       │  │   (:8081)    │  │
+     │  │    (10.99.0.100)   │  │       │  └─────────────────┘  └──────────────┘  │
+     │  └────────────────────┘  │       │                                         │
+     └──────────────────────────┘       └─────────────────────────────────────────┘
                     │                              
                     │router-dmz (HUB)    
                     │════════════════    
@@ -65,42 +65,42 @@ Implementation of **Zero Trust Architecture (ZTA)** with **Hub-and-Spoke** netwo
          │   10.99.0.0/24      │                   
          └──────────┬──────────┘                   
                     │                              
-         ┌──────────┴──────────┐
-         │                     │
-         ▼                     ▼
-┌─────────────────────────┐   ┌─────────────────────────┐
-│  AWS Cloud              │   │  OS Cloud               │
-│  (10.20.2.0/24)         │   │  (10.10.2.0/24)         │
-│  ═══════════════        │   │  ═════════════          │
-│                         │   │                         │
-│  ┌───────────────────┐  │   │  ┌───────────────────┐  │
-│  │  AWS GATEWAY      │  │   │  │  OS GATEWAY       │  │
-│  │  10.20.2.5        │  │   │  │  10.10.2.5        │  │
-│  │  WG: 10.99.0.1    │◄─────►│  WG: 10.99.0.2     │  │
-│  │                   │ mTLS │  │                   │  │
-│  │  • OPA (:9191)    │  │   │  │  • Envoy mTLS     │  │
-│  │  • Envoy (:8080)  │  │   │  │    (:443)         │  │
-│  │  • SPIRE Agent    │  │   │  │  • SPIRE Agent    │  │
-│  └───────────────────┘  │   │  └───────────────────┘  │
-│           │             │   │           │             │
-│  ┌───────────────────┐  │   │  ┌───────────────────┐  │
-│  │  AWS Cluster      │  │   │  │  OS Cluster       │  │
-│  │  10.20.2.10       │  │   │  │  10.10.2.10       │  │
-│  │  K3s (UI Pods)    │  │   │  │  K3s (Backend)    │  │
-│  └───────────────────┘  │   │  └───────────────────┘  │
-└─────────────────────────┘   └─────────────────────────┘
+         ┌──────────┴───────────────────────┐
+         │                                  │
+         ▼                                  ▼
+┌─────────────────────────┐    ┌─────────────────────────┐
+│  AWS Cloud              │    │  OS Cloud               │
+│  (10.20.2.0/24)         │    │  (10.10.2.0/24)         │
+│  ═══════════════        │    │  ═════════════          │
+│                         │    │                         │
+│  ┌───────────────────┐  │    │  ┌───────────────────┐  │
+│  │  AWS GATEWAY      │  │    │  │  OS GATEWAY       │  │
+│  │  10.20.2.5        │  │    │  │  10.10.2.5        │  │
+│  │  WG: 10.99.0.1    │  ◄─────► │  WG: 10.99.0.2    │  │
+│  │                   │   mTLS   │                   │  │
+│  │  • OPA (:9191)    │  │    │  │  • Envoy mTLS     │  │
+│  │  • Envoy (:8080)  │  │    │  │    (:443)         │  │
+│  │  • SPIRE Agent    │  │    │  │  • SPIRE Agent    │  │
+│  └───────────────────┘  │    │  └───────────────────┘  │
+│           │             │    │           │             │
+│  ┌───────────────────┐  │    │  ┌───────────────────┐  │
+│  │  AWS Cluster      │  │    │  │  OS Cluster       │  │
+│  │  10.20.2.10       │  │    │  │  10.10.2.10       │  │
+│  │  K3s (UI Pods)    │  │    │  │  K3s (Backend)    │  │
+│  └───────────────────┘  │    │  └───────────────────┘  │
+└─────────────────────────┘    └─────────────────────────┘
 ```
 
 ### Security Layers
 
-| Layer             | Technology    | Description                                        |
-|-------------------|---------------|----------------------------------------------------|
-| **L1: Network**   | Hub-and-Spoke | Isolated networks, no direct cross-network         |
-| **L2: Tunnel**    | WireGuard     | Encrypted tunnel between Auth Portal → Gateways    |
+| Layer             | Technology    | Description                                          |
+|-------------------|---------------|------------------------------------------------------|
+| **L1: Network**   | Hub-and-Spoke | Isolated networks, no direct cross-network           |
+| **L2: Tunnel**    | WireGuard     | Encrypted tunnel between Auth Portal → Gateways      |
 | **L3: Identity**  | SPIRE/SVID    | Workload identity with 5-minute certificate rotation |
-| **L4: AuthN**     | JWT (HS256)   | Token-based authentication, 15-minute lifetime     |
-| **L5: AuthZ**     | OPA/Rego      | Real-time policy decisions                         |
-| **L6: Transport** | mTLS          | Mutual TLS between AWS ↔ OS Gateways               |
+| **L4: AuthN**     | JWT (HS256)   | Token-based authentication, 15-minute lifetime       |
+| **L5: AuthZ**     | OPA/Rego      | Real-time policy decisions                           |
+| **L6: Transport** | mTLS          | Mutual TLS between AWS ↔ OS Gateways                 |
 
 ---
 
@@ -108,15 +108,15 @@ Implementation of **Zero Trust Architecture (ZTA)** with **Hub-and-Spoke** netwo
 
 ### VMs & Services
 
-| VM | Network | IP | Public | Services |
-|----|---------|-----|:------:|----------|
-| **vm-auth-portal** | DMZ | 10.50.1.10 | ✅ 172.10.10.170 | Login UI, JWT Server, WireGuard Hub |
-| **vm-identity** | Observability | 10.40.1.20 | ❌ | SPIRE Server |
-| **vm-monitoring** | Observability | 10.40.1.10 | ❌ | Prometheus, Grafana, Jaeger, Loki, Promtail |
-| **vm-aws-gateway** | Cloud AWS | 10.20.2.5 | ❌ | OPA, Envoy, SPIRE Agent, WG Spoke |
-| **vm-os-gateway** | Cloud OS | 10.10.2.5 | ❌ | Envoy mTLS, SPIRE Agent, WG Spoke |
-| **aws-master** | Cloud AWS | 10.20.2.10 | ❌ | K3s - UI Pods |
-| **os-master** | Cloud OS | 10.10.2.10 | ❌ | K3s - Backend API Pods |
+| VM                 | Network       | IP         | Public           | Services                                    |
+|--------------------|---------------|------------|:----------------:|---------------------------------------------|
+| **vm-auth-portal** | DMZ           | 10.50.1.10 | ✅ 172.10.10.170 | Login UI, JWT Server, WireGuard Hub         |
+| **vm-identity**    | Observability | 10.40.1.20 |        ❌        | SPIRE Server                                |
+| **vm-monitoring**  | Observability | 10.40.1.10 |        ❌        | Prometheus, Grafana, Jaeger, Loki, Promtail |
+| **vm-aws-gateway** | Cloud AWS     | 10.20.2.5  |        ❌        | OPA, Envoy, SPIRE Agent, WG Spoke           |
+| **vm-os-gateway**  | Cloud OS      | 10.10.2.5  |        ❌        | Envoy mTLS, SPIRE Agent, WG Spoke           |
+| **aws-master**     | Cloud AWS     | 10.20.2.10 |        ❌        | K3s - UI Pods                               |
+| **os-master**      | Cloud OS      | 10.10.2.10 |        ❌        | K3s - Backend API Pods                      |
 
 > ⚠️ **Zero Trust**: Only Auth Portal has public IP. All other services accessed via Auth Portal proxy or SSH tunnel.
 
@@ -174,21 +174,21 @@ ansible-playbook -i inventory/hosts.ini deploy-zta-hub-spoke.yml
 
 ### User Accounts (RBAC Demo)
 
-| User | Password | Permissions | Access |
-|------|----------|-------------|--------|
-| **viewer** | viewer123 | `aws:ui` | AWS UI only |
-| **aws_user** | aws123 | `aws:ui`, `aws:read` | AWS UI + AWS data API |
-| **full_user** | full123 | `aws:ui`, `aws:read`, `os:read` | AWS UI + AWS data + OS data |
-| **admin** | admin123 | All permissions | Full access including monitoring |
+| User          | Password  | Permissions                     | Access                           |
+|---------------|-----------|---------------------------------|----------------------------------|
+| **viewer**    | viewer123 | `aws:ui`                        | AWS UI only                      |
+| **aws_user**  | aws123    | `aws:ui`, `aws:read`            | AWS UI + AWS data API            |
+| **full_user** | full123   | `aws:ui`, `aws:read`, `os:read` | AWS UI + AWS data + OS data      |
+| **admin**     | admin123  | All permissions                 | Full access including monitoring |
 
 ### API Endpoints
 
-| Endpoint | Method | Auth | Description |
-|----------|--------|------|-------------|
-| `/api/login` | POST | None | Get JWT token |
-| `/api/users` | GET | JWT | List users |
-| `/api/aws/data` | GET | JWT + `aws:read` | AWS data (requires aws:read) |
-| `/api/os/data` | GET | JWT + `os:read` | OS data (requires os:read) |
+| Endpoint        | Method | Auth             | Description                  |
+|-----------------|--------|------------------|------------------------------|
+| `/api/login`    | POST   | None             | Get JWT token                |
+| `/api/users`    | GET    | JWT              | List users                   |
+| `/api/aws/data` | GET    | JWT + `aws:read` | AWS data (requires aws:read) |
+| `/api/os/data`  | GET    | JWT + `os:read`  | OS data (requires os:read)   |
 
 ### E2E Test Commands
 
@@ -299,13 +299,13 @@ sudo wg show wg0
 
 ## 🔑 Credentials
 
-| Service | Username | Password | Access |
-|---------|----------|----------|--------|
-| Auth Portal | viewer | viewer123 | AWS UI only |
-| Auth Portal | aws_user | aws123 | AWS UI + data |
-| Auth Portal | full_user | full123 | AWS + OS data |
-| Auth Portal | admin | admin123 | Full access |
-| Grafana | admin | admin | Via SSH tunnel |
+| Service     | Username  | Password  | Access         |
+|-------------|-----------|-----------|----------------|
+| Auth Portal | viewer    | viewer123 | AWS UI only    |
+| Auth Portal | aws_user  | aws123    | AWS UI + data  |
+| Auth Portal | full_user | full123   | AWS + OS data  |
+| Auth Portal | admin     | admin123  | Full access    |
+| Grafana     | admin     | admin     | Via SSH tunnel |
 
 ### Access Monitoring (No Public IP)
 
@@ -323,17 +323,17 @@ ssh -L 9090:10.40.1.10:9090 -i ~/.ssh/id_rsa_zerotrust ubuntu@172.10.10.170
 
 ## 📊 Ports Reference
 
-| Port | Service | Location |
-|------|---------|----------|
-| 80 | Auth Portal UI | vm-auth-portal |
-| 8888 | JWT API Server | vm-auth-portal |
-| 8080 | Envoy Proxy | vm-aws-gateway |
-| 9191 | OPA gRPC | vm-aws-gateway |
-| 443 | Envoy mTLS | vm-os-gateway |
-| 8081 | SPIRE Server | vm-identity |
-| 51820/UDP | WireGuard | All gateways |
-| 3000 | Grafana | vm-monitoring |
-| 9090 | Prometheus | vm-monitoring |
+| Port      | Service        | Location       |
+|-----------|----------------|----------------|
+| 80        | Auth Portal UI | vm-auth-portal |
+| 8888      | JWT API Server | vm-auth-portal |
+| 8080      | Envoy Proxy    | vm-aws-gateway |
+| 9191      | OPA gRPC       | vm-aws-gateway |
+| 443       | Envoy mTLS     | vm-os-gateway  |
+| 8081      | SPIRE Server   | vm-identity    |
+| 51820/UDP | WireGuard      | All gateways   |
+| 3000      | Grafana        | vm-monitoring  |
+| 9090      | Prometheus     | vm-monitoring  |
 
 ---
 
