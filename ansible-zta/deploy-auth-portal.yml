@@ -1,0 +1,740 @@
+---
+# Single Entry Point Authentication Deployment
+# This playbook deploys the Auth Portal in ISOLATED DMZ Network
+# Auth Portal is deployed on vm-auth-portal (DMZ - 10.50.1.0/24)
+# SEPARATED from AWS (10.20.2.0/24) and OS (10.10.2.0/24) clusters
+
+- name: Deploy Auth Portal (Single Entry Point - DMZ)
+  hosts: vm-auth-portal
+  become: yes
+  vars:
+    aws_gateway_public_ip: "{{ hostvars['vm-aws-gateway']['ansible_host'] | default('10.20.2.5') }}"
+    # Zero Trust: Monitoring has NO public IP - use internal IP
+    monitoring_internal_ip: "{{ monitoring_internal_ip | default('10.40.1.10') }}"
+    auth_portal_public_ip: "{{ ansible_host | default('172.10.10.170') }}"
+  tasks:
+    - name: Install Docker
+      shell: curl -fsSL https://get.docker.com | sh
+      args: { creates: /usr/bin/docker }
+    
+    - name: Install Docker SDK for Python
+      apt:
+        name: python3-docker
+        state: present
+        update_cache: yes
+    
+    - name: Create auth portal directory
+      file:
+        path: /opt/auth-portal
+        state: directory
+        mode: '0755'
+
+    - name: Create Auth Portal HTML
+      copy:
+        dest: /opt/auth-portal/index.html
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>ZTA Auth Portal - Single Entry Point</title>
+            <style>
+              * { box-sizing: border-box; margin: 0; padding: 0; }
+              body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+                min-height: 100vh;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                color: #fff;
+              }
+              .container {
+                background: rgba(255, 255, 255, 0.1);
+                backdrop-filter: blur(10px);
+                border-radius: 20px;
+                padding: 40px;
+                width: 100%;
+                max-width: 450px;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+              }
+              h1 {
+                text-align: center;
+                margin-bottom: 10px;
+                font-size: 1.8rem;
+                background: linear-gradient(90deg, #00d4ff, #7c3aed);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+              }
+              .subtitle {
+                text-align: center;
+                color: #a0aec0;
+                margin-bottom: 30px;
+                font-size: 0.9rem;
+              }
+              .badge {
+                display: inline-block;
+                background: #7c3aed;
+                color: white;
+                padding: 4px 12px;
+                border-radius: 20px;
+                font-size: 0.75rem;
+                margin-bottom: 20px;
+              }
+              .form-group {
+                margin-bottom: 20px;
+              }
+              label {
+                display: block;
+                margin-bottom: 8px;
+                color: #e2e8f0;
+                font-size: 0.9rem;
+              }
+              input {
+                width: 100%;
+                padding: 14px 16px;
+                border: 2px solid rgba(255, 255, 255, 0.1);
+                border-radius: 10px;
+                background: rgba(255, 255, 255, 0.05);
+                color: #fff;
+                font-size: 1rem;
+                transition: all 0.3s ease;
+              }
+              input:focus {
+                outline: none;
+                border-color: #7c3aed;
+                background: rgba(255, 255, 255, 0.1);
+              }
+              input::placeholder { color: #64748b; }
+              button {
+                width: 100%;
+                padding: 14px;
+                border: none;
+                border-radius: 10px;
+                font-size: 1rem;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.3s ease;
+                margin-top: 10px;
+              }
+              .btn-primary {
+                background: linear-gradient(135deg, #7c3aed 0%, #00d4ff 100%);
+                color: white;
+              }
+              .btn-primary:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 4px 20px rgba(124, 58, 237, 0.4);
+              }
+              .btn-secondary {
+                background: rgba(255, 255, 255, 0.1);
+                color: #e2e8f0;
+                border: 1px solid rgba(255, 255, 255, 0.2);
+              }
+              .btn-secondary:hover {
+                background: rgba(255, 255, 255, 0.15);
+              }
+              .result {
+                margin-top: 20px;
+                padding: 15px;
+                border-radius: 10px;
+                font-size: 0.9rem;
+                word-break: break-all;
+              }
+              .result.success {
+                background: rgba(16, 185, 129, 0.2);
+                border: 1px solid rgba(16, 185, 129, 0.4);
+                color: #10b981;
+              }
+              .result.error {
+                background: rgba(239, 68, 68, 0.2);
+                border: 1px solid rgba(239, 68, 68, 0.4);
+                color: #ef4444;
+              }
+              .result.info {
+                background: rgba(59, 130, 246, 0.2);
+                border: 1px solid rgba(59, 130, 246, 0.4);
+                color: #60a5fa;
+              }
+              .token-display {
+                background: rgba(0, 0, 0, 0.3);
+                padding: 15px;
+                border-radius: 10px;
+                margin-top: 20px;
+                font-family: monospace;
+                font-size: 0.75rem;
+                max-height: 150px;
+                overflow-y: auto;
+                word-break: break-all;
+              }
+              .actions {
+                margin-top: 20px;
+                display: flex;
+                gap: 10px;
+              }
+              .actions button { flex: 1; }
+              .links {
+                margin-top: 25px;
+                padding-top: 20px;
+                border-top: 1px solid rgba(255, 255, 255, 0.1);
+                text-align: center;
+              }
+              .links a {
+                display: inline-block;
+                color: #00d4ff;
+                text-decoration: none;
+                margin: 5px 10px;
+                font-size: 0.9rem;
+                transition: color 0.3s;
+              }
+              .links a:hover { color: #7c3aed; }
+              .status-bar {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                background: rgba(0, 0, 0, 0.2);
+                padding: 10px 15px;
+                border-radius: 10px;
+                margin-bottom: 20px;
+                font-size: 0.85rem;
+              }
+              .status-indicator {
+                width: 10px;
+                height: 10px;
+                border-radius: 50%;
+                display: inline-block;
+                margin-right: 8px;
+              }
+              .status-indicator.online { background: #10b981; }
+              .status-indicator.offline { background: #ef4444; }
+              .hidden { display: none; }
+              .flow-diagram {
+                background: rgba(0, 0, 0, 0.2);
+                padding: 15px;
+                border-radius: 10px;
+                margin-top: 15px;
+                font-size: 0.75rem;
+                font-family: monospace;
+                text-align: center;
+                color: #a0aec0;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <div style="text-align: center;">
+                <span class="badge">SINGLE ENTRY POINT</span>
+              </div>
+              <h1>🔐 ZTA Auth Portal</h1>
+              <p class="subtitle">Zero Trust Authentication Gateway</p>
+              
+              <div class="status-bar">
+                <span><span class="status-indicator online" id="keycloakStatus"></span>Keycloak</span>
+                <span id="authStatus">Not authenticated</span>
+              </div>
+              
+              <div id="loginForm">
+                <div class="form-group">
+                  <label for="username">Username</label>
+                  <input type="text" id="username" placeholder="Enter username" value="demo">
+                </div>
+                <div class="form-group">
+                  <label for="password">Password</label>
+                  <input type="password" id="password" placeholder="Enter password" value="demo123">
+                </div>
+                <button class="btn-primary" onclick="login()">🚀 Authenticate & Get JWT</button>
+              </div>
+              
+              <div id="tokenSection" class="hidden">
+                <div class="result success">
+                  ✅ Authentication successful! JWT token issued.
+                </div>
+                <div class="token-display" id="tokenDisplay"></div>
+                <div class="actions">
+                  <button class="btn-secondary" onclick="copyToken()">📋 Copy JWT</button>
+                  <button class="btn-secondary" onclick="logout()">🚪 Logout</button>
+                </div>
+                <div class="flow-diagram">
+                  Auth Portal → JWT → AWS Cluster UI → OS Backend Data
+                </div>
+              </div>
+              
+              <div id="result"></div>
+              
+              <div class="links">
+                <p style="color: #64748b; margin-bottom: 10px;">After login, access:</p>
+                <a href="http://{{ aws_gateway_public_ip }}" target="_blank">🌐 AWS Cluster UI</a>
+                <p style="color: #94a3b8; font-size: 12px; margin-top: 10px;">📊 Grafana & 🔍 Jaeger: Use SSH tunnel (no public IP)</p>
+              </div>
+            </div>
+            
+            <script>
+              const KEYCLOAK_URL = 'http://{{ monitoring_internal_ip }}:8080';
+              const AWS_GATEWAY = 'http://{{ aws_gateway_public_ip }}';
+              
+              checkKeycloakStatus();
+              checkExistingToken();
+              
+              async function checkKeycloakStatus() {
+                try {
+                  const res = await fetch(KEYCLOAK_URL + '/realms/zta', { mode: 'no-cors' });
+                  document.getElementById('keycloakStatus').className = 'status-indicator online';
+                } catch (e) {
+                  document.getElementById('keycloakStatus').className = 'status-indicator offline';
+                }
+              }
+              
+              function checkExistingToken() {
+                const token = localStorage.getItem('zta_jwt');
+                if (token) {
+                  showTokenSection(token);
+                }
+              }
+              
+              async function login() {
+                const username = document.getElementById('username').value;
+                const password = document.getElementById('password').value;
+                const resultDiv = document.getElementById('result');
+                
+                resultDiv.innerHTML = '<div class="result info">🔄 Authenticating with Keycloak...</div>';
+                
+                try {
+                  const res = await fetch(KEYCLOAK_URL + '/realms/zta/protocol/openid-connect/token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({
+                      'username': username,
+                      'password': password,
+                      'grant_type': 'password',
+                      'client_id': 'zta-web'
+                    })
+                  });
+                  
+                  const data = await res.json();
+                  
+                  if (data.access_token) {
+                    localStorage.setItem('zta_jwt', data.access_token);
+                    localStorage.setItem('zta_refresh', data.refresh_token || '');
+                    localStorage.setItem('zta_expires', Date.now() + (data.expires_in * 1000));
+                    
+                    showTokenSection(data.access_token);
+                    resultDiv.innerHTML = '';
+                    document.getElementById('authStatus').textContent = '✅ Authenticated';
+                    document.getElementById('authStatus').style.color = '#10b981';
+                  } else {
+                    resultDiv.innerHTML = '<div class="result error">❌ Authentication failed: ' + (data.error_description || data.error || 'Unknown error') + '</div>';
+                  }
+                } catch (err) {
+                  resultDiv.innerHTML = '<div class="result error">❌ Connection error: ' + err.message + '</div>';
+                }
+              }
+              
+              function showTokenSection(token) {
+                document.getElementById('loginForm').classList.add('hidden');
+                document.getElementById('tokenSection').classList.remove('hidden');
+                
+                try {
+                  const payload = JSON.parse(atob(token.split('.')[1]));
+                  document.getElementById('tokenDisplay').innerHTML = 
+                    '<strong>JWT Payload:</strong>\n' + JSON.stringify(payload, null, 2);
+                } catch (e) {
+                  document.getElementById('tokenDisplay').textContent = token.substring(0, 100) + '...';
+                }
+              }
+              
+              function copyToken() {
+                const token = localStorage.getItem('zta_jwt');
+                navigator.clipboard.writeText(token).then(() => {
+                  alert('JWT token copied!\n\nGo to AWS Cluster UI: ' + AWS_GATEWAY + '\n\nThe token is shared via localStorage.');
+                });
+              }
+              
+              function logout() {
+                localStorage.removeItem('zta_jwt');
+                localStorage.removeItem('zta_refresh');
+                localStorage.removeItem('zta_expires');
+                document.getElementById('loginForm').classList.remove('hidden');
+                document.getElementById('tokenSection').classList.add('hidden');
+                document.getElementById('authStatus').textContent = 'Not authenticated';
+                document.getElementById('authStatus').style.color = '';
+                document.getElementById('result').innerHTML = '<div class="result info">👋 Logged out successfully</div>';
+              }
+            </script>
+          </body>
+          </html>
+
+    - name: Deploy Auth Portal container
+      docker_container:
+        name: auth-portal
+        image: nginx:alpine
+        state: started
+        restart_policy: always
+        ports: ["8888:80"]
+        volumes:
+          - /opt/auth-portal/index.html:/usr/share/nginx/html/index.html:ro
+
+    - name: Wait for Auth Portal to be ready
+      wait_for:
+        host: localhost
+        port: 8888
+        delay: 5
+        timeout: 60
+
+    - name: Display Auth Portal URL
+      debug:
+        msg: "Auth Portal (DMZ) deployed at: http://{{ auth_portal_public_ip }}:8888"
+
+# Update AWS Frontend with new UI that uses JWT from Auth Portal
+- name: Update AWS Frontend
+  hosts: aws-master
+  become: yes
+  vars:
+    aws_gateway_public_ip: "{{ hostvars['vm-aws-gateway']['ansible_host'] | default('10.20.2.5') }}"
+    # Zero Trust: Monitoring has NO public IP
+    monitoring_internal_ip: "{{ monitoring_internal_ip | default('10.40.1.10') }}"
+    auth_portal_public_ip: "{{ hostvars['vm-auth-portal']['ansible_host'] | default('172.10.10.170') }}"
+  tasks:
+    - name: Update Frontend ConfigMap and Deployment
+      shell: |
+        cat <<'EOF' | kubectl apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: { name: frontend-html }
+        data:
+          index.html: |
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>AWS Cluster UI - Zero Trust Demo</title>
+              <style>
+                * { box-sizing: border-box; margin: 0; padding: 0; }
+                body {
+                  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                  background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+                  min-height: 100vh;
+                  padding: 20px;
+                  color: #e2e8f0;
+                }
+                .header {
+                  display: flex;
+                  justify-content: space-between;
+                  align-items: center;
+                  padding: 20px;
+                  background: rgba(255, 255, 255, 0.05);
+                  border-radius: 15px;
+                  margin-bottom: 20px;
+                }
+                .logo { display: flex; align-items: center; gap: 15px; }
+                .logo h1 { font-size: 1.5rem; }
+                .logo span { 
+                  background: linear-gradient(135deg, #f97316 0%, #fb923c 100%);
+                  padding: 5px 12px;
+                  border-radius: 20px;
+                  font-size: 0.75rem;
+                  font-weight: 600;
+                }
+                .auth-status {
+                  display: flex;
+                  align-items: center;
+                  gap: 10px;
+                }
+                .status-dot {
+                  width: 12px;
+                  height: 12px;
+                  border-radius: 50%;
+                }
+                .status-dot.auth { background: #10b981; }
+                .status-dot.unauth { background: #ef4444; }
+                .container {
+                  display: grid;
+                  grid-template-columns: 1fr 1fr;
+                  gap: 20px;
+                }
+                @media (max-width: 900px) {
+                  .container { grid-template-columns: 1fr; }
+                }
+                .card {
+                  background: rgba(255, 255, 255, 0.05);
+                  border-radius: 15px;
+                  padding: 25px;
+                  border: 1px solid rgba(255, 255, 255, 0.1);
+                }
+                .card h2 {
+                  color: #f97316;
+                  margin-bottom: 15px;
+                  font-size: 1.2rem;
+                }
+                .flow-box {
+                  background: rgba(0, 0, 0, 0.3);
+                  padding: 20px;
+                  border-radius: 10px;
+                  font-family: monospace;
+                  font-size: 0.85rem;
+                  line-height: 2;
+                }
+                .flow-arrow { color: #f97316; }
+                button {
+                  padding: 12px 24px;
+                  border: none;
+                  border-radius: 8px;
+                  font-size: 0.95rem;
+                  font-weight: 600;
+                  cursor: pointer;
+                  transition: all 0.3s;
+                  margin: 5px;
+                }
+                .btn-primary {
+                  background: linear-gradient(135deg, #f97316 0%, #fb923c 100%);
+                  color: white;
+                }
+                .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 4px 15px rgba(249, 115, 22, 0.4); }
+                .btn-secondary {
+                  background: rgba(255, 255, 255, 0.1);
+                  color: #e2e8f0;
+                  border: 1px solid rgba(255, 255, 255, 0.2);
+                }
+                .btn-secondary:hover { background: rgba(255, 255, 255, 0.15); }
+                .btn-login {
+                  background: linear-gradient(135deg, #7c3aed 0%, #a855f7 100%);
+                  color: white;
+                }
+                .result-box {
+                  margin-top: 20px;
+                  padding: 20px;
+                  border-radius: 10px;
+                  background: rgba(0, 0, 0, 0.3);
+                  max-height: 400px;
+                  overflow-y: auto;
+                }
+                .result-box.success { border-left: 4px solid #10b981; }
+                .result-box.error { border-left: 4px solid #ef4444; }
+                .result-box.info { border-left: 4px solid #3b82f6; }
+                pre {
+                  font-size: 0.85rem;
+                  white-space: pre-wrap;
+                  word-break: break-all;
+                }
+                .token-info {
+                  background: rgba(124, 58, 237, 0.2);
+                  padding: 15px;
+                  border-radius: 10px;
+                  margin-bottom: 15px;
+                  font-size: 0.85rem;
+                }
+                .token-info strong { color: #a855f7; }
+                .security-layers {
+                  display: flex;
+                  flex-wrap: wrap;
+                  gap: 10px;
+                  margin-top: 15px;
+                }
+                .layer-badge {
+                  background: rgba(16, 185, 129, 0.2);
+                  color: #10b981;
+                  padding: 5px 12px;
+                  border-radius: 20px;
+                  font-size: 0.75rem;
+                  border: 1px solid rgba(16, 185, 129, 0.3);
+                }
+                .links { margin-top: 20px; }
+                .links a {
+                  color: #60a5fa;
+                  text-decoration: none;
+                  margin-right: 15px;
+                }
+                .links a:hover { text-decoration: underline; }
+              </style>
+            </head>
+            <body>
+              <div class="header">
+                <div class="logo">
+                  <h1>☁️ AWS Cluster UI</h1>
+                  <span>FRONTEND</span>
+                </div>
+                <div class="auth-status">
+                  <span class="status-dot" id="statusDot"></span>
+                  <span id="authLabel">Checking...</span>
+                </div>
+              </div>
+              
+              <div class="container">
+                <div class="card">
+                  <h2>🔄 Zero Trust Request Flow</h2>
+                  <div class="flow-box">
+                    <div>1️⃣ Auth Portal <span class="flow-arrow">→</span> Keycloak</div>
+                    <div>2️⃣ Keycloak <span class="flow-arrow">→</span> JWT Token</div>
+                    <div>3️⃣ User + JWT <span class="flow-arrow">→</span> AWS Cluster UI</div>
+                    <div>4️⃣ AWS Envoy <span class="flow-arrow">→</span> JWT Validation</div>
+                    <div>5️⃣ WireGuard mTLS <span class="flow-arrow">→</span> OS Gateway</div>
+                    <div>6️⃣ OS Gateway <span class="flow-arrow">→</span> Backend Data</div>
+                  </div>
+                  
+                  <div id="tokenInfo" class="token-info" style="display:none;">
+                    <strong>Current JWT Info:</strong>
+                    <div id="jwtDetails"></div>
+                  </div>
+                  
+                  <div class="links">
+                    <a href="http://{{ auth_portal_public_ip }}:8888" target="_blank">🔐 Auth Portal (DMZ)</a>
+                    <p style="color: #94a3b8; font-size: 12px;">📊 Grafana: Use SSH tunnel (localhost:3000)</p>
+                  </div>
+                </div>
+                
+                <div class="card">
+                  <h2>📡 Data Operations</h2>
+                  
+                  <div id="noAuthSection">
+                    <p style="color: #94a3b8; margin-bottom: 15px;">
+                      You need to authenticate first. Get a JWT from the Auth Portal.
+                    </p>
+                    <button class="btn-login" onclick="goToAuthPortal()">🔐 Go to Auth Portal</button>
+                    <button class="btn-secondary" onclick="pasteToken()">📋 Paste JWT Token</button>
+                  </div>
+                  
+                  <div id="authSection" style="display:none;">
+                    <button class="btn-primary" onclick="fetchSecureData()">📥 Fetch OS Cluster Data</button>
+                    <button class="btn-secondary" onclick="fetchHealth()">❤️ Health Check</button>
+                    <button class="btn-secondary" onclick="clearToken()">🚪 Clear Token</button>
+                  </div>
+                  
+                  <div id="resultBox" class="result-box info">
+                    <p>Click a button above to make API requests through the Zero Trust pipeline.</p>
+                  </div>
+                  
+                  <div class="security-layers">
+                    <span class="layer-badge">JWT Auth</span>
+                    <span class="layer-badge">Envoy Proxy</span>
+                    <span class="layer-badge">OPA Policy</span>
+                    <span class="layer-badge">mTLS Tunnel</span>
+                    <span class="layer-badge">OS Gateway</span>
+                  </div>
+                </div>
+              </div>
+              
+              <script>
+                const AUTH_PORTAL = 'http://{{ auth_portal_public_ip }}:8888';
+                
+                checkAuthStatus();
+                
+                function checkAuthStatus() {
+                  const token = localStorage.getItem('zta_jwt');
+                  const statusDot = document.getElementById('statusDot');
+                  const authLabel = document.getElementById('authLabel');
+                  const noAuthSection = document.getElementById('noAuthSection');
+                  const authSection = document.getElementById('authSection');
+                  const tokenInfo = document.getElementById('tokenInfo');
+                  
+                  if (token && isTokenValid(token)) {
+                    statusDot.className = 'status-dot auth';
+                    authLabel.textContent = 'Authenticated';
+                    noAuthSection.style.display = 'none';
+                    authSection.style.display = 'block';
+                    tokenInfo.style.display = 'block';
+                    
+                    try {
+                      const payload = JSON.parse(atob(token.split('.')[1]));
+                      const exp = new Date(payload.exp * 1000);
+                      document.getElementById('jwtDetails').innerHTML = 
+                        'User: ' + (payload.preferred_username || payload.sub) + '<br>' +
+                        'Expires: ' + exp.toLocaleTimeString();
+                    } catch (e) {}
+                  } else {
+                    statusDot.className = 'status-dot unauth';
+                    authLabel.textContent = 'Not Authenticated';
+                    noAuthSection.style.display = 'block';
+                    authSection.style.display = 'none';
+                    tokenInfo.style.display = 'none';
+                  }
+                }
+                
+                function isTokenValid(token) {
+                  try {
+                    const payload = JSON.parse(atob(token.split('.')[1]));
+                    return payload.exp * 1000 > Date.now();
+                  } catch (e) {
+                    return false;
+                  }
+                }
+                
+                function goToAuthPortal() {
+                  window.open(AUTH_PORTAL, '_blank');
+                }
+                
+                function pasteToken() {
+                  const token = prompt('Paste your JWT token from Auth Portal:');
+                  if (token && token.length > 20) {
+                    localStorage.setItem('zta_jwt', token);
+                    checkAuthStatus();
+                    showResult('info', '✅ Token saved! You can now fetch data.');
+                  }
+                }
+                
+                function clearToken() {
+                  localStorage.removeItem('zta_jwt');
+                  checkAuthStatus();
+                  showResult('info', '👋 Token cleared. Please re-authenticate.');
+                }
+                
+                async function fetchSecureData() {
+                  const token = localStorage.getItem('zta_jwt');
+                  if (!token) {
+                    showResult('error', '❌ No JWT token. Please authenticate first.');
+                    return;
+                  }
+                  
+                  showResult('info', '🔄 Fetching data from OS Cluster via Zero Trust pipeline...');
+                  
+                  try {
+                    const res = await fetch('/api/secure-data', {
+                      headers: { 'Authorization': 'Bearer ' + token }
+                    });
+                    
+                    if (res.ok) {
+                      const data = await res.json();
+                      showResult('success', '✅ Data received from OS Cluster:\n\n' + JSON.stringify(data, null, 2));
+                    } else if (res.status === 401) {
+                      showResult('error', '❌ Unauthorized (401): Token expired or invalid.\nPlease re-authenticate.');
+                      localStorage.removeItem('zta_jwt');
+                      checkAuthStatus();
+                    } else if (res.status === 403) {
+                      showResult('error', '❌ Forbidden (403): OPA policy denied the request.');
+                    } else {
+                      showResult('error', '❌ Error: HTTP ' + res.status);
+                    }
+                  } catch (err) {
+                    showResult('error', '❌ Network error: ' + err.message);
+                  }
+                }
+                
+                async function fetchHealth() {
+                  showResult('info', '🔄 Checking health...');
+                  try {
+                    const res = await fetch('/health');
+                    showResult('success', '✅ AWS Gateway is healthy\nStatus: ' + res.status);
+                  } catch (err) {
+                    showResult('error', '❌ Health check failed: ' + err.message);
+                  }
+                }
+                
+                function showResult(type, message) {
+                  const box = document.getElementById('resultBox');
+                  box.className = 'result-box ' + type;
+                  box.innerHTML = '<pre>' + message + '</pre>';
+                }
+                
+                setInterval(checkAuthStatus, 10000);
+              </script>
+            </body>
+            </html>
+        EOF
+
+    - name: Restart frontend pods
+      shell: kubectl rollout restart deployment frontend
+      ignore_errors: yes
+
+    - name: Display Frontend URL
+      debug:
+        msg: "AWS Frontend updated at: http://{{ aws_gateway_public_ip }}"

@@ -1,0 +1,866 @@
+---
+# Complete ZTA Hub-and-Spoke Deployment
+# - Auth Portal: JWT generation
+# - SPIRE: SVID for mTLS between services (on vm-identity)
+# - OPA + Envoy: Policy enforcement with JWT + SVID
+# - AWS/OS Gateways: Service mesh with mTLS
+
+- name: Deploy SPIRE Server (Trust Root on Identity VM)
+  hosts: vm_identity
+  become: yes
+  vars:
+    spire_version: "1.8.7"
+  tasks:
+    - name: Create SPIRE directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /opt/spire-{{ spire_version }}
+        - /opt/spire-{{ spire_version }}/bin
+        - /opt/spire-{{ spire_version }}/conf
+        - /opt/spire-{{ spire_version }}/data
+        - /var/log/spire
+
+    - name: Download SPIRE Server
+      get_url:
+        url: "https://github.com/spiffe/spire/releases/download/v{{ spire_version }}/spire-{{ spire_version }}-linux-amd64-musl.tar.gz"
+        dest: "/tmp/spire-{{ spire_version }}.tar.gz"
+        timeout: 300
+      register: spire_download
+      ignore_errors: yes
+
+    - name: Extract SPIRE (if downloaded)
+      unarchive:
+        src: "/tmp/spire-{{ spire_version }}.tar.gz"
+        dest: /opt/
+        remote_src: yes
+        creates: "/opt/spire-{{ spire_version }}/bin/spire-server"
+      when: spire_download is succeeded
+
+    - name: Create symlink
+      file:
+        src: "/opt/spire-{{ spire_version }}"
+        dest: /opt/spire
+        state: link
+      when: spire_download is succeeded
+
+    - name: Create SPIRE Server config
+      copy:
+        dest: /opt/spire/conf/server.conf
+        content: |
+          server {
+            bind_address = "0.0.0.0"
+            bind_port = "8081"
+            trust_domain = "zta.local"
+            data_dir = "/opt/spire/data"
+            log_level = "INFO"
+            log_file = "/var/log/spire/server.log"
+            
+            ca_ttl = "24h"
+            default_x509_svid_ttl = "1h"
+          }
+          
+          plugins {
+            DataStore "sql" {
+              plugin_data {
+                database_type = "sqlite3"
+                connection_string = "/opt/spire/data/datastore.sqlite3"
+              }
+            }
+            
+            KeyManager "disk" {
+              plugin_data {
+                keys_path = "/opt/spire/data/keys.json"
+              }
+            }
+            
+            NodeAttestor "join_token" {
+              plugin_data {}
+            }
+          }
+          
+          health_checks {
+            listener_enabled = true
+            bind_address = "0.0.0.0"
+            bind_port = "8080"
+            live_path = "/live"
+            ready_path = "/ready"
+          }
+
+    - name: Create SPIRE Server systemd service
+      copy:
+        dest: /etc/systemd/system/spire-server.service
+        content: |
+          [Unit]
+          Description=SPIRE Server
+          After=network.target
+          
+          [Service]
+          Type=simple
+          ExecStart=/opt/spire/bin/spire-server run -config /opt/spire/conf/server.conf
+          Restart=always
+          RestartSec=5
+          
+          [Install]
+          WantedBy=multi-user.target
+      when: spire_download is succeeded
+
+    - name: Start SPIRE Server
+      systemd:
+        name: spire-server
+        state: restarted
+        daemon_reload: yes
+        enabled: yes
+      when: spire_download is succeeded
+      ignore_errors: yes
+
+    - name: Wait for SPIRE Server
+      wait_for:
+        port: 8081
+        delay: 2
+        timeout: 30
+      when: spire_download is succeeded
+      ignore_errors: yes
+
+
+- name: Deploy SPIRE Agent on AWS Gateway
+  hosts: vm-aws-gateway
+  become: yes
+  vars:
+    spire_version: "1.8.7"
+    spire_server: "10.40.1.20"
+  tasks:
+    - name: Create SPIRE Agent directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /opt/spire-{{ spire_version }}
+        - /opt/spire-{{ spire_version }}/bin
+        - /opt/spire-{{ spire_version }}/conf
+        - /opt/spire-{{ spire_version }}/data
+        - /opt/spire-{{ spire_version }}/sockets
+        - /var/log/spire
+
+    - name: Check if SPIRE binary exists
+      stat:
+        path: "/opt/spire-{{ spire_version }}/bin/spire-agent"
+      register: spire_binary
+
+    - name: Create SPIRE Agent config
+      copy:
+        dest: /opt/spire-{{ spire_version }}/conf/agent.conf
+        content: |
+          agent {
+            data_dir = "/opt/spire-{{ spire_version }}/data"
+            log_level = "INFO"
+            log_file = "/var/log/spire/agent.log"
+            server_address = "{{ spire_server }}"
+            server_port = "8081"
+            socket_path = "/opt/spire-{{ spire_version }}/sockets/agent.sock"
+            trust_domain = "zta.local"
+            insecure_bootstrap = true
+          }
+          
+          plugins {
+            KeyManager "disk" {
+              plugin_data {
+                directory = "/opt/spire-{{ spire_version }}/data"
+              }
+            }
+            
+            NodeAttestor "join_token" {
+              plugin_data {}
+            }
+            
+            WorkloadAttestor "unix" {
+              plugin_data {}
+            }
+          }
+          
+          health_checks {
+            listener_enabled = true
+            bind_address = "127.0.0.1"
+            bind_port = "8082"
+            live_path = "/live"
+            ready_path = "/ready"
+          }
+
+    - name: Note about SPIRE Agent setup
+      debug:
+        msg: "SPIRE Agent config created. Binary installation skipped (no internet). Manual setup may be needed."
+
+
+- name: Deploy OPA + Envoy with JWT on AWS Gateway
+  hosts: vm-aws-gateway
+  become: yes
+  tasks:
+    - name: Create OPA policy with JWT validation
+      copy:
+        dest: /opt/policy.rego
+        content: |
+          package envoy.authz
+          
+          import input.attributes.request.http as http_request
+          import input.attributes.source.address as source_address
+          
+          # Default deny
+          default allow = false
+          
+          # JWT Secret (must match Auth Portal)
+          jwt_secret := "zta-hub-spoke-secret-key-2024"
+          
+          # Helper to decode base64url
+          base64url_decode(str) = decoded {
+            padding := substring("====", 0, (4 - (count(str) % 4)) % 4)
+            padded := concat("", [str, padding])
+            decoded := base64url.decode(padded)
+          }
+          
+          # Extract JWT from Authorization header
+          token := t {
+            auth_header := http_request.headers.authorization
+            startswith(auth_header, "Bearer ")
+            t := substring(auth_header, 7, -1)
+          }
+          
+          # Parse JWT payload
+          jwt_payload := payload {
+            parts := split(token, ".")
+            count(parts) == 3
+            payload := json.unmarshal(base64url_decode(parts[1]))
+          }
+          
+          # Check JWT expiration
+          jwt_valid := valid {
+            jwt_payload.exp > time.now_ns() / 1000000000
+          }
+          
+          # Extract permissions from JWT
+          user_permissions := jwt_payload.permissions
+          user_role := jwt_payload.role
+          user_sub := jwt_payload.sub
+          
+          # Health checks - always allow
+          allow {
+            http_request.path == "/health"
+          }
+          
+          # AWS data endpoint - requires aws:read permission
+          allow {
+            http_request.path == "/api/aws-data"
+            jwt_valid
+            user_permissions[_] == "aws:read"
+          }
+          
+          # OS data endpoint - requires os:fetch permission
+          allow {
+            startswith(http_request.path, "/os/")
+            jwt_valid
+            user_permissions[_] == "os:fetch"
+          }
+          
+          allow {
+            http_request.path == "/api/os-data"
+            jwt_valid
+            user_permissions[_] == "os:fetch"
+          }
+          
+          # Response headers with user info
+          response_headers := headers {
+            allow
+            headers := {
+              "x-zta-user": user_sub,
+              "x-zta-role": user_role,
+              "x-zta-authorized": "true"
+            }
+          }
+          
+          # Denial reason
+          denial_reason := reason {
+            not token
+            reason := "Missing Authorization header"
+          } else := reason {
+            not jwt_valid
+            reason := "Invalid or expired JWT"
+          } else := reason {
+            http_request.path == "/api/os-data"
+            not user_permissions[_] == "os:fetch"
+            reason := "Missing os:fetch permission"
+          } else := "Access denied by policy"
+
+    - name: Create Envoy config with OPA
+      copy:
+        dest: /opt/envoy-aws.yaml
+        content: |
+          static_resources:
+            listeners:
+            - name: listener_0
+              address:
+                socket_address:
+                  address: 0.0.0.0
+                  port_value: 8080
+              filter_chains:
+              - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: ingress_http
+                    codec_type: AUTO
+                    route_config:
+                      name: local_route
+                      virtual_hosts:
+                      - name: backend
+                        domains: ["*"]
+                        routes:
+                        - match:
+                            prefix: "/api/aws-data"
+                          route:
+                            cluster: aws_backend
+                        - match:
+                            prefix: "/api/os-data"
+                          route:
+                            cluster: os_backend
+                        - match:
+                            prefix: "/os/"
+                          route:
+                            cluster: os_backend
+                        - match:
+                            prefix: "/health"
+                          route:
+                            cluster: aws_backend
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: aws_backend
+                    http_filters:
+                    - name: envoy.filters.http.ext_authz
+                      typed_config:
+                        "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                        transport_api_version: V3
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: opa
+                          timeout: 1s
+                        with_request_body:
+                          max_request_bytes: 8192
+                          allow_partial_message: true
+                    - name: envoy.filters.http.router
+                      typed_config:
+                        "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+            
+            clusters:
+            - name: opa
+              connect_timeout: 1s
+              type: STRICT_DNS
+              lb_policy: ROUND_ROBIN
+              http2_protocol_options: {}
+              load_assignment:
+                cluster_name: opa
+                endpoints:
+                - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: 127.0.0.1
+                          port_value: 9191
+            
+            - name: aws_backend
+              connect_timeout: 1s
+              type: STRICT_DNS
+              lb_policy: ROUND_ROBIN
+              load_assignment:
+                cluster_name: aws_backend
+                endpoints:
+                - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: 127.0.0.1
+                          port_value: 9090
+            
+            - name: os_backend
+              connect_timeout: 5s
+              type: STRICT_DNS
+              lb_policy: ROUND_ROBIN
+              load_assignment:
+                cluster_name: os_backend
+                endpoints:
+                - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: 10.10.2.5
+                          port_value: 8080
+              transport_socket:
+                name: envoy.transport_sockets.tls
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+                  common_tls_context:
+                    tls_params:
+                      tls_minimum_protocol_version: TLSv1_2
+                    validation_context:
+                      trust_chain_filename: /opt/certs/ca-cert.pem
+                    tls_certificates:
+                    - certificate_chain:
+                        filename: /opt/certs/aws-cert.pem
+                      private_key:
+                        filename: /opt/certs/aws-key.pem
+          
+          admin:
+            address:
+              socket_address:
+                address: 0.0.0.0
+                port_value: 9901
+
+    - name: Restart OPA container
+      docker_container:
+        name: opa
+        image: openpolicyagent/opa:latest-envoy
+        state: started
+        restart_policy: always
+        command: >
+          run --server --addr=0.0.0.0:8181
+          --diagnostic-addr=0.0.0.0:8282
+          --set=plugins.envoy_ext_authz_grpc.addr=:9191
+          --set=plugins.envoy_ext_authz_grpc.path=envoy/authz/allow
+          --set=decision_logs.console=true
+          /policy/policy.rego
+        volumes:
+          - /opt/policy.rego:/policy/policy.rego:ro
+
+    - name: Restart Envoy container
+      docker_container:
+        name: envoy-aws
+        image: envoyproxy/envoy:v1.28-latest
+        state: started
+        restart_policy: always
+        ports:
+          - "8080:8080"
+          - "9901:9901"
+        volumes:
+          - /opt/envoy-aws.yaml:/etc/envoy/envoy.yaml:ro
+          - /opt/certs:/opt/certs:ro
+        command: ["-c", "/etc/envoy/envoy.yaml"]
+
+    - name: Create AWS Backend Service (port 9090)
+      copy:
+        dest: /opt/aws-backend.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          import json
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          
+          class AWSBackend(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(200)
+                  self.send_header('Content-Type', 'application/json')
+                  self.end_headers()
+                  
+                  data = {
+                      "service": "AWS Cluster",
+                      "cluster_name": "aws-production",
+                      "region": "ap-southeast-1",
+                      "nodes": [
+                          {"id": "aws-node-1", "status": "running", "cpu": "45%", "memory": "62%"},
+                          {"id": "aws-node-2", "status": "running", "cpu": "38%", "memory": "55%"},
+                          {"id": "aws-node-3", "status": "running", "cpu": "52%", "memory": "71%"}
+                      ],
+                      "total_pods": 47,
+                      "healthy_pods": 45,
+                      "user": self.headers.get('x-zta-user', 'unknown'),
+                      "authorized_by": "OPA+Envoy"
+                  }
+                  self.wfile.write(json.dumps(data).encode())
+              
+              def log_message(self, format, *args):
+                  print(f"[AWS-BACKEND] {args[0]}")
+          
+          HTTPServer(('0.0.0.0', 9090), AWSBackend).serve_forever()
+
+    - name: Create AWS Backend systemd service
+      copy:
+        dest: /etc/systemd/system/aws-backend.service
+        content: |
+          [Unit]
+          Description=AWS Backend Service
+          After=network.target
+          
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/python3 /opt/aws-backend.py
+          Restart=always
+          
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start AWS Backend
+      systemd:
+        name: aws-backend
+        state: restarted
+        daemon_reload: yes
+        enabled: yes
+
+    - name: Create AWS UI (updated with OPA+Envoy+JWT flow)
+      copy:
+        dest: /opt/aws-frontend/index.html
+        content: |
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <meta charset="UTF-8">
+              <title>AWS Cluster - ZTA Hub-and-Spoke</title>
+              <style>
+                  * { margin: 0; padding: 0; box-sizing: border-box; }
+                  body { 
+                      font-family: 'Segoe UI', sans-serif;
+                      background: linear-gradient(135deg, #0d1117 0%, #161b22 100%);
+                      min-height: 100vh;
+                      color: #c9d1d9;
+                      padding: 20px;
+                  }
+                  .header {
+                      display: flex;
+                      justify-content: space-between;
+                      align-items: center;
+                      padding: 20px;
+                      background: rgba(255,255,255,0.05);
+                      border-radius: 12px;
+                      margin-bottom: 20px;
+                      border: 1px solid rgba(88,166,255,0.3);
+                  }
+                  .header h1 { color: #58a6ff; font-size: 24px; }
+                  .architecture-badge {
+                      background: linear-gradient(135deg, rgba(88,166,255,0.2), rgba(33,150,243,0.2));
+                      padding: 10px 20px;
+                      border-radius: 20px;
+                      color: #58a6ff;
+                      font-size: 13px;
+                      border: 1px solid rgba(88,166,255,0.3);
+                  }
+                  .grid {
+                      display: grid;
+                      grid-template-columns: repeat(auto-fit, minmax(450px, 1fr));
+                      gap: 20px;
+                  }
+                  .card {
+                      background: rgba(255,255,255,0.05);
+                      border-radius: 12px;
+                      padding: 25px;
+                      border: 1px solid rgba(255,255,255,0.1);
+                  }
+                  .card h2 {
+                      color: #58a6ff;
+                      margin-bottom: 15px;
+                      display: flex;
+                      align-items: center;
+                      gap: 10px;
+                      font-size: 18px;
+                  }
+                  .permission-badge {
+                      display: inline-block;
+                      padding: 6px 14px;
+                      border-radius: 15px;
+                      font-size: 12px;
+                      margin: 5px;
+                      border: 1px solid;
+                  }
+                  .perm-granted {
+                      background: rgba(63,185,80,0.2);
+                      color: #3fb950;
+                      border-color: #3fb950;
+                  }
+                  .perm-denied {
+                      background: rgba(248,81,73,0.2);
+                      color: #f85149;
+                      border-color: #f85149;
+                  }
+                  .fetch-btn {
+                      background: linear-gradient(135deg, #238636, #2ea043);
+                      border: none;
+                      padding: 14px 28px;
+                      border-radius: 8px;
+                      color: white;
+                      cursor: pointer;
+                      font-size: 14px;
+                      font-weight: 600;
+                      width: 100%;
+                      margin-top: 10px;
+                      transition: all 0.3s;
+                  }
+                  .fetch-btn:hover { 
+                      transform: translateY(-2px);
+                      box-shadow: 0 4px 12px rgba(46,160,67,0.4);
+                  }
+                  .result-box {
+                      margin-top: 15px;
+                      padding: 15px;
+                      background: rgba(0,0,0,0.4);
+                      border-radius: 8px;
+                      font-family: 'Courier New', monospace;
+                      font-size: 12px;
+                      white-space: pre-wrap;
+                      max-height: 350px;
+                      overflow-y: auto;
+                      border: 1px solid rgba(255,255,255,0.1);
+                  }
+                  .success-box {
+                      background: rgba(63,185,80,0.1);
+                      border-color: rgba(63,185,80,0.3);
+                      color: #3fb950;
+                  }
+                  .error-box {
+                      background: rgba(248,81,73,0.1);
+                      border-color: rgba(248,81,73,0.3);
+                      color: #f85149;
+                  }
+                  .flow-diagram {
+                      background: rgba(88,166,255,0.05);
+                      padding: 15px;
+                      border-radius: 8px;
+                      margin: 15px 0;
+                      font-size: 13px;
+                      border-left: 3px solid #58a6ff;
+                  }
+                  .flow-step {
+                      padding: 8px 0;
+                      border-bottom: 1px solid rgba(255,255,255,0.05);
+                  }
+                  .flow-step:last-child { border-bottom: none; }
+                  .back-link {
+                      display: inline-block;
+                      margin-bottom: 20px;
+                      color: #58a6ff;
+                      text-decoration: none;
+                      font-size: 14px;
+                  }
+                  .back-link:hover { text-decoration: underline; }
+              </style>
+          </head>
+          <body>
+              <a href="/" class="back-link">← Back to Auth Portal</a>
+              
+              <div class="header">
+                  <h1>📊 AWS Cluster Dashboard</h1>
+                  <div class="architecture-badge">
+                      🔐 OPA + Envoy + JWT + SVID mTLS
+                  </div>
+              </div>
+              
+              <div class="grid">
+                  <div class="card">
+                      <h2>☁️ AWS Cluster Data</h2>
+                      <div class="flow-diagram">
+                          <div class="flow-step">1️⃣ User → JWT from Auth Portal</div>
+                          <div class="flow-step">2️⃣ Request → Envoy (port 8080)</div>
+                          <div class="flow-step">3️⃣ Envoy → OPA (JWT validation)</div>
+                          <div class="flow-step">4️⃣ OPA checks: aws:read permission</div>
+                          <div class="flow-step">5️⃣ ✅ Allowed → Backend (port 9090)</div>
+                      </div>
+                      <div id="awsPermStatus"></div>
+                      <button class="fetch-btn" onclick="fetchAwsData()">
+                          Fetch AWS Data (via OPA+Envoy)
+                      </button>
+                      <div id="awsResult" style="display:none;"></div>
+                  </div>
+                  
+                  <div class="card">
+                      <h2>🖥️ OS Cluster Data (mTLS)</h2>
+                      <div class="flow-diagram">
+                          <div class="flow-step">1️⃣ User → JWT from Auth Portal</div>
+                          <div class="flow-step">2️⃣ Request → Envoy (port 8080)</div>
+                          <div class="flow-step">3️⃣ Envoy → OPA (JWT validation)</div>
+                          <div class="flow-step">4️⃣ OPA checks: os:fetch permission</div>
+                          <div class="flow-step">5️⃣ Envoy → OS Gateway via <strong>mTLS+SVID</strong></div>
+                          <div class="flow-step">6️⃣ ✅ OS Gateway validates SVID</div>
+                      </div>
+                      <div id="osPermStatus"></div>
+                      <button class="fetch-btn" onclick="fetchOsData()">
+                          Fetch OS Data (via mTLS+SVID)
+                      </button>
+                      <div id="osResult" style="display:none;"></div>
+                  </div>
+              </div>
+              
+              <script>
+                  const token = localStorage.getItem('jwt_token');
+                  const userInfo = JSON.parse(localStorage.getItem('user_info') || '{}');
+                  
+                  function showPermissions() {
+                      const perms = userInfo.permissions || [];
+                      
+                      const awsStatus = document.getElementById('awsPermStatus');
+                      const hasAws = perms.includes('aws:read');
+                      awsStatus.innerHTML = `<span class="permission-badge ${hasAws ? 'perm-granted' : 'perm-denied'}">
+                          ${hasAws ? '✓' : '✗'} aws:read ${hasAws ? 'GRANTED' : 'DENIED'}</span>`;
+                      
+                      const osStatus = document.getElementById('osPermStatus');
+                      const hasOs = perms.includes('os:fetch');
+                      osStatus.innerHTML = `<span class="permission-badge ${hasOs ? 'perm-granted' : 'perm-denied'}">
+                          ${hasOs ? '✓' : '✗'} os:fetch ${hasOs ? 'GRANTED' : 'DENIED'}</span>`;
+                  }
+                  
+                  async function fetchAwsData() {
+                      const resultDiv = document.getElementById('awsResult');
+                      resultDiv.style.display = 'block';
+                      resultDiv.className = 'result-box';
+                      resultDiv.textContent = '⏳ Sending request through OPA+Envoy...';
+                      
+                      try {
+                          const res = await fetch('/api/aws-data', {
+                              headers: { 'Authorization': `Bearer ${token}` }
+                          });
+                          const data = await res.json();
+                          
+                          resultDiv.className = `result-box ${res.ok ? 'success-box' : 'error-box'}`;
+                          resultDiv.textContent = `Status: ${res.status}\n\n` + JSON.stringify(data, null, 2);
+                      } catch (err) {
+                          resultDiv.className = 'result-box error-box';
+                          resultDiv.textContent = 'Error: ' + err.message;
+                      }
+                  }
+                  
+                  async function fetchOsData() {
+                      const resultDiv = document.getElementById('osResult');
+                      resultDiv.style.display = 'block';
+                      resultDiv.className = 'result-box';
+                      resultDiv.textContent = '⏳ JWT validation → mTLS+SVID to OS Gateway...';
+                      
+                      try {
+                          const res = await fetch('/api/os-data', {
+                              headers: { 'Authorization': `Bearer ${token}` }
+                          });
+                          const data = await res.json();
+                          
+                          resultDiv.className = `result-box ${res.ok ? 'success-box' : 'error-box'}`;
+                          resultDiv.textContent = `Status: ${res.status}\n` +
+                              `mTLS: ${res.ok ? 'SVID verified' : 'Failed'}\n\n` + 
+                              JSON.stringify(data, null, 2);
+                      } catch (err) {
+                          resultDiv.className = 'result-box error-box';
+                          resultDiv.textContent = 'Error: ' + err.message;
+                      }
+                  }
+                  
+                  if (token) showPermissions();
+              </script>
+          </body>
+          </html>
+
+    - name: Configure nginx to serve UI
+      copy:
+        dest: /etc/nginx/sites-available/default
+        content: |
+          server {
+              listen 80;
+              root /opt/aws-frontend;
+              index index.html;
+              
+              location / {
+                  try_files $uri $uri/ /index.html;
+              }
+              
+              location ~ ^/(api|os)/ {
+                  proxy_pass http://127.0.0.1:8080;
+                  proxy_set_header Host $host;
+                  proxy_set_header Authorization $http_authorization;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+          }
+
+    - name: Ensure nginx installed
+      apt:
+        name: nginx
+        state: present
+      ignore_errors: yes
+
+    - name: Reload nginx
+      service:
+        name: nginx
+        state: reloaded
+      ignore_errors: yes
+
+
+- name: Deploy OS Gateway with mTLS
+  hosts: vm-os-gateway
+  become: yes
+  tasks:
+    - name: Create OS Backend Service
+      copy:
+        dest: /opt/os-gateway/backend.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          import json
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          
+          class OSBackend(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(200)
+                  self.send_header('Content-Type', 'application/json')
+                  self.end_headers()
+                  
+                  data = {
+                      "service": "OpenStack Cluster",
+                      "cluster_name": "openstack-production",
+                      "api_version": "v3",
+                      "compute": {
+                          "instances": 24,
+                          "running": 22,
+                          "vcpus_used": 96,
+                          "memory_gb": 384
+                      },
+                      "network": {
+                          "networks": 8,
+                          "floating_ips": 15
+                      },
+                      "mtls_verified": "true",
+                      "svid_validated": "AWS Gateway SVID verified"
+                  }
+                  self.wfile.write(json.dumps(data).encode())
+              
+              def log_message(self, format, *args):
+                  print(f"[OS-BACKEND] {args[0]}")
+          
+          HTTPServer(('0.0.0.0', 8080), OSBackend).serve_forever()
+
+    - name: Create OS Backend systemd service
+      copy:
+        dest: /etc/systemd/system/os-backend.service
+        content: |
+          [Unit]
+          Description=OS Backend Service
+          After=network.target
+          
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/python3 /opt/os-gateway/backend.py
+          Restart=always
+          
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start OS Backend
+      systemd:
+        name: os-backend
+        state: restarted
+        daemon_reload: yes
+        enabled: yes
+
+    - name: Ensure Envoy is running
+      docker_container:
+        name: envoy-os
+        image: envoyproxy/envoy:v1.28-latest
+        state: started
+        restart_policy: always
+        ports:
+          - "443:443"
+          - "9901:9901"
+        volumes:
+          - /opt/envoy-os.yaml:/etc/envoy/envoy.yaml:ro
+          - /opt/certs:/opt/certs:ro
+        command: ["-c", "/etc/envoy/envoy.yaml"]

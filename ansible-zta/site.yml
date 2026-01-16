@@ -42,7 +42,7 @@
           -s accessTokenLifespan=900 \
           -s accessTokenLifespanForImplicitFlow=900 \
           -s ssoSessionIdleTimeout=900 \
-          -s ssoSessionMaxLifespan=3600 || true
+          -s ssoSessionMaxLifespan=900 || true
         
         docker exec keycloak $KC create users -r zta -s username=demo -s enabled=true || true
         docker exec keycloak $KC set-password -r zta --username demo --new-password demo123
@@ -62,7 +62,7 @@
 # SPIRE Server with Full Zero Trust Configuration
 # ============================================================
 - name: Deploy SPIRE Server
-  hosts: vm-monitoring
+  hosts: vm_identity
   become: yes
   tasks:
     - get_url: { url: "https://github.com/spiffe/spire/releases/download/v1.8.7/spire-1.8.7-linux-amd64-musl.tar.gz", dest: /tmp/spire.tar.gz }
@@ -170,7 +170,7 @@
     
     - slurp: { src: /opt/spire/aws-token.txt }
       register: aws_token
-      delegate_to: vm-monitoring
+      delegate_to: vm-identity
       ignore_errors: yes
     
     - copy:
@@ -180,7 +180,7 @@
             data_dir = "/opt/spire/data"
             log_level = "DEBUG"
             log_file = "/var/log/spire-agent.log"
-            server_address = "{{ monitoring_public_ip }}"
+            server_address = "{{ identity_internal_ip }}"
             server_port = "8081"
             socket_path = "/opt/spire/run/agent.sock"
             trust_domain = "zta.local"
@@ -233,7 +233,7 @@
             data_dir = "/opt/spire/data"
             log_level = "DEBUG"
             log_file = "/var/log/spire-agent.log"
-            server_address = "{{ monitoring_public_ip }}"
+            server_address = "{{ identity_internal_ip }}"
             server_port = "8081"
             socket_path = "/opt/spire/run/agent.sock"
             trust_domain = "zta.local"
@@ -413,7 +413,7 @@
           After=network.target
           [Service]
           Type=simple
-          ExecStart=/usr/bin/socat TCP-LISTEN:8888,reuseaddr,fork TCP:{{ monitoring_public_ip }}:8080
+          ExecStart=/usr/bin/socat TCP-LISTEN:8888,reuseaddr,fork TCP:{{ monitoring_internal_ip }}:8080
           Restart=always
           RestartSec=5
           [Install]

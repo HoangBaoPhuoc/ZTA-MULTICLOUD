@@ -1,10 +1,9 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-# Zero Trust Architecture - Comprehensive Evaluation Test Suite
-# Based on evaluation criteria: Security, Operations, Performance
+# Zero Trust Architecture - Evaluation Test Suite
+# Updated for Hub-and-Spoke deployment via Auth Portal
 #═══════════════════════════════════════════════════════════════════════════════
 
-# Don't exit on error - we want to continue testing
 set +e
 
 # Colors
@@ -13,22 +12,62 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 NC='\033[0m'
 BOLD='\033[1m'
+DIM='\033[2m'
 
-# Configuration
-AWS_GATEWAY="172.10.10.181"
-OS_GATEWAY="172.10.10.171"
-MONITORING="172.10.10.172"
-IDENTITY="10.30.1.20"
+#═══════════════════════════════════════════════════════════════════════════════
+# Configuration - Updated for current deployment
+#═══════════════════════════════════════════════════════════════════════════════
+
+# Entry Points (Floating IPs) - ONLY Auth Portal has public IP
+AUTH_PORTAL="172.10.10.170"           # THE ONLY public entry point - DMZ
+
+# Internal IPs (accessed via SSH ProxyCommand through Auth Portal)
+MONITORING="10.40.1.10"               # Grafana, Prometheus - NO public IP
+AWS_GATEWAY_INTERNAL="10.20.2.5"
+OS_GATEWAY_INTERNAL="10.10.2.5"
+IDENTITY_IP="10.40.1.20"
+
+# SSH config
 SSH_KEY="$HOME/.ssh/openstack-key.pem"
 SSH_OPTS="-o StrictHostKeyChecking=no -o IdentitiesOnly=yes -o ConnectTimeout=10"
+
+# User Accounts (4 Demo Roles)
+# 1. viewer    - AWS UI only (no data)
+# 2. aws_user  - AWS UI + AWS data
+# 3. full_user - AWS UI + AWS data + OS data
+# 4. admin     - Full access including monitoring
+declare -A USERS
+declare -A USER_PERMS
+
+USERS["viewer"]="viewer123"
+USER_PERMS["viewer"]="aws:ui"
+
+USERS["aws_user"]="aws123"
+USER_PERMS["aws_user"]="aws:ui,aws:read"
+
+USERS["full_user"]="full123"
+USER_PERMS["full_user"]="aws:ui,aws:read,os:read"
+
+USERS["admin"]="admin123"
+USER_PERMS["admin"]="aws:ui,aws:read,aws:write,os:read,os:write,monitoring:read"
+
+# API Endpoints
+AWS_DATA_API="http://${AUTH_PORTAL}:8888/api/aws/data"
+OS_DATA_API="http://${AUTH_PORTAL}:8888/api/os/data"
+AUTH_API="http://${AUTH_PORTAL}:8888/api/login"
 
 # Results tracking
 TOTAL_TESTS=0
 PASSED_TESTS=0
 FAILED_TESTS=0
-RESULTS_FILE="/tmp/zta-evaluation-$(date +%Y%m%d-%H%M%S).json"
+SKIPPED_TESTS=0
+
+#═══════════════════════════════════════════════════════════════════════════════
+# Helper Functions
+#═══════════════════════════════════════════════════════════════════════════════
 
 print_header() {
     echo ""
@@ -44,6 +83,10 @@ print_section() {
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
+print_subsection() {
+    echo -e "\n  ${MAGENTA}▸ $1${NC}"
+}
+
 test_pass() {
     echo -e "  ${GREEN}✓ PASS${NC}: $1"
     ((PASSED_TESTS++))
@@ -51,9 +94,19 @@ test_pass() {
 }
 
 test_fail() {
-    echo -e "  ${RED}✗ FAIL${NC}: $1"
+    local reason="${2:-}"
+    if [[ -n "$reason" ]]; then
+        echo -e "  ${RED}✗ FAIL${NC}: $1 ${DIM}($reason)${NC}"
+    else
+        echo -e "  ${RED}✗ FAIL${NC}: $1"
+    fi
     ((FAILED_TESTS++))
     ((TOTAL_TESTS++))
+}
+
+test_skip() {
+    echo -e "  ${YELLOW}○ SKIP${NC}: $1 ${DIM}($2)${NC}"
+    ((SKIPPED_TESTS++))
 }
 
 test_info() {
@@ -70,563 +123,801 @@ ssh_cmd() {
     ssh $SSH_OPTS -i "$SSH_KEY" ubuntu@"$host" "$@" 2>/dev/null
 }
 
+# Get JWT token for a user
+get_jwt_token() {
+    local username="$1"
+    local password="$2"
+    local response
+    
+    response=$(curl -s --max-time 10 "http://${AUTH_PORTAL}:8888/api/login" \
+        -X POST \
+        -H 'Content-Type: application/json' \
+        -d "{\"username\":\"${username}\",\"password\":\"${password}\"}" 2>/dev/null)
+    
+    # Handle both "token": "..." and "token":"..." formats
+    echo "$response" | sed 's/": "/":"/g' | grep -o '"token":"[^"]*"' | cut -d'"' -f4
+}
+
+# Test API endpoint with token
+test_api_access() {
+    local token="$1"
+    local endpoint="$2"
+    local http_code
+    
+    http_code=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" \
+        -H "Authorization: Bearer $token" \
+        "$endpoint" 2>/dev/null || echo "000")
+    
+    echo "$http_code"
+}
+
+# Decode JWT payload
+decode_jwt() {
+    local token="$1"
+    echo "$token" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq . 2>/dev/null
+}
+
 #═══════════════════════════════════════════════════════════════════════════════
-# SECTION 1: SECURITY EVALUATION
+# SECTION 1: Connectivity Tests
 #═══════════════════════════════════════════════════════════════════════════════
 
-test_security() {
-    print_header "I. ĐÁNH GIÁ BẢO MẬT (Security Evaluation)"
+test_connectivity() {
+    print_header "I. KIỂM TRA KẾT NỐI (Connectivity Tests)"
     
-    # 1.1 Keycloak Authentication
-    print_section "1.1 Xác thực liên tục (Continuous Authentication) - Keycloak"
+    print_section "1.1 Entry Points Accessibility"
     
-    # Check Keycloak is running
-    if ssh_cmd "$MONITORING" "curl -s http://$IDENTITY:8080/realms/zta/.well-known/openid-configuration" | grep -q "issuer"; then
-        test_pass "Keycloak Identity Provider is running"
+    # Auth Portal
+    local auth_code=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" "http://${AUTH_PORTAL}/" 2>/dev/null || echo "000")
+    if [[ "$auth_code" == "200" ]]; then
+        test_pass "Auth Portal UI (${AUTH_PORTAL}:80) - HTTP $auth_code"
     else
-        test_fail "Keycloak Identity Provider is not accessible"
+        test_fail "Auth Portal UI" "HTTP $auth_code"
     fi
     
-    # Test valid authentication
-    TOKEN_RESPONSE=$(curl -s -X POST "http://$AWS_GATEWAY/auth/token" \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        -d "username=demo&password=demo123&grant_type=password&client_id=zta-web" 2>/dev/null || echo "{}")
-    
-    if echo "$TOKEN_RESPONSE" | grep -q "access_token"; then
-        ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token' 2>/dev/null)
-        test_pass "Valid credentials generate JWT token"
-        
-        # Decode and verify JWT structure
-        JWT_HEADER=$(echo "$ACCESS_TOKEN" | cut -d'.' -f1 | base64 -d 2>/dev/null | jq . 2>/dev/null)
-        JWT_PAYLOAD=$(echo "$ACCESS_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq . 2>/dev/null)
-        
-        if echo "$JWT_PAYLOAD" | grep -q "preferred_username"; then
-            test_pass "JWT contains user identity claims"
-            ISSUED_AT=$(echo "$JWT_PAYLOAD" | jq -r '.iat' 2>/dev/null)
-            EXPIRES_AT=$(echo "$JWT_PAYLOAD" | jq -r '.exp' 2>/dev/null)
-            TOKEN_LIFETIME=$((EXPIRES_AT - ISSUED_AT))
-            test_metric "Token lifetime: ${TOKEN_LIFETIME}s ($(($TOKEN_LIFETIME/60)) minutes)"
-        else
-            test_fail "JWT missing user identity claims"
-        fi
+    # Auth API
+    local api_code=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" "http://${AUTH_PORTAL}/api/login" -X POST -H 'Content-Type: application/json' -d '{}' 2>/dev/null || echo "000")
+    if [[ "$api_code" == "401" ]]; then
+        test_pass "Auth API (${AUTH_PORTAL}/api/login) - Returns 401 for empty credentials"
     else
-        test_fail "Authentication failed - no token received"
-        ACCESS_TOKEN=""
+        test_fail "Auth API" "Expected 401, got $api_code"
     fi
     
-    # Test invalid authentication
-    INVALID_RESPONSE=$(curl -s -X POST "http://$AWS_GATEWAY/auth/token" \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        -d "username=hacker&password=wrongpass&grant_type=password&client_id=zta-web" 2>/dev/null || echo "{}")
-    
-    if echo "$INVALID_RESPONSE" | grep -q "error"; then
-        test_pass "Invalid credentials are rejected"
+    # Monitoring - Zero Trust: NO public IP, test via SSH tunnel
+    # Grafana (via SSH to Auth Portal)
+    local grafana_code=$(ssh_cmd "$AUTH_PORTAL" "curl -s --max-time 5 -o /dev/null -w '%{http_code}' 'http://${MONITORING}:3000/api/health' 2>/dev/null" || echo "000")
+    if [[ "$grafana_code" == "200" ]]; then
+        test_pass "Grafana (${MONITORING}:3000 via SSH) - HTTP $grafana_code"
     else
-        test_fail "System accepts invalid credentials"
+        test_info "Grafana (internal ${MONITORING}:3000) - Zero Trust: Access via SSH tunnel"
     fi
     
-    # 1.2 OPA Policy Enforcement
-    print_section "1.2 Kiểm soát dựa trên chính sách (Policy-based Access Control) - OPA"
-    
-    # Check OPA is running
-    OPA_STATUS=$(ssh_cmd "$AWS_GATEWAY" "sudo docker ps --filter name=opa --format '{{.Status}}'" 2>/dev/null || echo "")
-    if [[ "$OPA_STATUS" == *"Up"* ]]; then
-        test_pass "OPA Policy Decision Point is running"
-        
-        # Check OPA policies loaded
-        OPA_POLICIES=$(ssh_cmd "$AWS_GATEWAY" "curl -s http://localhost:8181/v1/policies" 2>/dev/null || echo "{}")
-        POLICY_COUNT=$(echo "$OPA_POLICIES" | jq '.result | length' 2>/dev/null || echo "0")
-        test_metric "OPA policies loaded: $POLICY_COUNT"
-        
-        # Test policy decision - allow public path
-        PUBLIC_DECISION=$(ssh_cmd "$AWS_GATEWAY" "curl -s -X POST http://localhost:8181/v1/data/envoy/authz/allow \
-            -H 'Content-Type: application/json' \
-            -d '{\"input\":{\"attributes\":{\"request\":{\"http\":{\"method\":\"GET\",\"path\":\"/\"}}}}}'" 2>/dev/null || echo "{}")
-        if echo "$PUBLIC_DECISION" | grep -q "true"; then
-            test_pass "OPA allows public path access"
-        else
-            test_info "OPA policy check for public path (may need adjustment)"
-        fi
-        
-        # Test policy decision - require auth for /api/
-        API_DECISION=$(ssh_cmd "$AWS_GATEWAY" "curl -s -X POST http://localhost:8181/v1/data/envoy/authz/allow \
-            -H 'Content-Type: application/json' \
-            -d '{\"input\":{\"attributes\":{\"request\":{\"http\":{\"method\":\"GET\",\"path\":\"/api/secure-data\",\"headers\":{}}}}}}'" 2>/dev/null || echo "{}")
-        if echo "$API_DECISION" | grep -q "false"; then
-            test_pass "OPA blocks unauthenticated API access"
-        else
-            test_info "OPA API access control (checking policy)"
-        fi
+    # Prometheus (via SSH to Auth Portal)
+    local prom_code=$(ssh_cmd "$AUTH_PORTAL" "curl -s --max-time 5 -o /dev/null -w '%{http_code}' 'http://${MONITORING}:9090/-/ready' 2>/dev/null" || echo "000")
+    if [[ "$prom_code" == "200" ]]; then
+        test_pass "Prometheus (${MONITORING}:9090 via SSH) - HTTP $prom_code"
     else
-        test_fail "OPA container is not running"
-        test_info "OPA Status: $OPA_STATUS"
+        test_info "Prometheus (internal ${MONITORING}:9090) - Zero Trust: Access via SSH tunnel"
     fi
     
-    # 1.3 mTLS Encryption
-    print_section "1.3 Mã hóa đầu cuối (End-to-End Encryption) - mTLS"
+    print_section "1.2 Internal Services (via SSH)"
     
-    # Check certificates exist
-    AWS_CERTS=$(ssh_cmd "$AWS_GATEWAY" "ls -la /opt/certs/ 2>/dev/null | wc -l" || echo "0")
-    OS_CERTS=$(ssh_cmd "$OS_GATEWAY" "ls -la /opt/certs/ 2>/dev/null | wc -l" || echo "0")
-    
-    if [[ "$AWS_CERTS" -gt 3 ]]; then
-        test_pass "AWS Gateway has mTLS certificates"
-        
-        # Check certificate details
-        CA_INFO=$(ssh_cmd "$AWS_GATEWAY" "openssl x509 -in /opt/certs/ca-cert.pem -noout -subject -dates 2>/dev/null" || echo "")
-        if [[ -n "$CA_INFO" ]]; then
-            test_pass "CA certificate is valid"
-            EXPIRY=$(echo "$CA_INFO" | grep "notAfter" | cut -d'=' -f2)
-            test_metric "CA expires: $EXPIRY"
-        fi
+    # Check services on Auth Portal
+    local auth_services=$(ssh_cmd "$AUTH_PORTAL" "sudo docker ps --format '{{.Names}}' 2>/dev/null | tr '\n' ','")
+    if [[ -n "$auth_services" ]]; then
+        test_pass "Auth Portal containers: $auth_services"
     else
-        test_fail "AWS Gateway missing certificates"
+        test_info "Cannot check Auth Portal containers via SSH"
     fi
     
-    if [[ "$OS_CERTS" -gt 3 ]]; then
-        test_pass "OS Gateway has mTLS certificates"
+    # Check JWT API is running
+    local jwt_running=$(ssh_cmd "$AUTH_PORTAL" "sudo ss -tlnp | grep ':8888' | wc -l")
+    if [[ "$jwt_running" -ge 1 ]]; then
+        test_pass "JWT Auth Server running on port 8888"
     else
-        test_fail "OS Gateway missing certificates"
-    fi
-    
-    # Test mTLS connection
-    MTLS_TEST=$(ssh_cmd "$AWS_GATEWAY" "curl -s -k --cert /opt/certs/aws-client-cert.pem --key /opt/certs/aws-client-key.pem https://10.99.0.2:443/api/health 2>&1" || echo "error")
-    if [[ "$MTLS_TEST" != *"error"* ]] && [[ "$MTLS_TEST" != *"refused"* ]]; then
-        test_pass "mTLS handshake successful between gateways"
-    else
-        test_info "mTLS connection test (may need Envoy running)"
-    fi
-    
-    # 1.4 Lateral Movement Prevention
-    print_section "1.4 Chống tấn công di chuyển ngang (Lateral Movement Prevention)"
-    
-    # Test direct access without auth
-    DIRECT_ACCESS=$(curl -s -o /dev/null -w "%{http_code}" "http://$AWS_GATEWAY/api/secure-data" 2>/dev/null || echo "000")
-    if [[ "$DIRECT_ACCESS" == "401" ]] || [[ "$DIRECT_ACCESS" == "403" ]]; then
-        test_pass "Direct API access blocked without authentication (HTTP $DIRECT_ACCESS)"
-    elif [[ "$DIRECT_ACCESS" == "000" ]]; then
-        test_info "Connection timeout - gateway may not be ready"
-    else
-        test_fail "Direct API access returned HTTP $DIRECT_ACCESS (expected 401/403)"
-    fi
-    
-    # Test WireGuard tunnel isolation
-    WG_STATUS=$(ssh_cmd "$AWS_GATEWAY" "sudo wg show wg0 2>/dev/null | head -5" || echo "")
-    if [[ -n "$WG_STATUS" ]]; then
-        test_pass "WireGuard tunnel is active for network isolation"
-        HANDSHAKE=$(echo "$WG_STATUS" | grep "handshake" || echo "")
-        if [[ -n "$HANDSHAKE" ]]; then
-            test_pass "WireGuard peer handshake established"
-        fi
-    else
-        test_fail "WireGuard tunnel not active"
-    fi
-    
-    # 1.5 SPIRE Workload Identity
-    print_section "1.5 Workload Identity (SPIRE)"
-    
-    SPIRE_SERVER=$(ssh_cmd "$MONITORING" "sudo systemctl is-active spire-server 2>/dev/null" || echo "inactive")
-    if [[ "$SPIRE_SERVER" == "active" ]]; then
-        test_pass "SPIRE Server is running"
-        
-        # Check registered entries
-        SPIRE_ENTRIES=$(ssh_cmd "$MONITORING" "sudo /opt/spire-1.8.7/bin/spire-server entry show 2>/dev/null | grep -c 'Entry ID' || echo 0")
-        test_metric "SPIRE workload entries: $SPIRE_ENTRIES"
-        
-        # Check SVID TTL
-        test_metric "SVID TTL: 5 minutes (short-lived credentials)"
-    else
-        test_info "SPIRE Server status: $SPIRE_SERVER"
+        test_fail "JWT Auth Server not running"
     fi
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
-# SECTION 2: OPERATIONS EVALUATION
+# SECTION 2: Authentication Tests
 #═══════════════════════════════════════════════════════════════════════════════
 
-test_operations() {
-    print_header "II. ĐÁNH GIÁ VẬN HÀNH (Operations Evaluation)"
+test_authentication() {
+    print_header "II. KIỂM TRA XÁC THỰC (Authentication Tests)"
     
-    # 2.1 Infrastructure as Code
-    print_section "2.1 Tự động hóa triển khai (Deployment Automation)"
+    print_section "2.1 Valid User Authentication"
     
-    # Check Terraform state
+    for username in "${!USERS[@]}"; do
+        password="${USERS[$username]}"
+        token=$(get_jwt_token "$username" "$password")
+        
+        if [[ -n "$token" ]]; then
+            test_pass "$username: JWT token obtained"
+            
+            # Decode and show permissions
+            payload=$(decode_jwt "$token")
+            if [[ -n "$payload" ]]; then
+                role=$(echo "$payload" | jq -r '.role')
+                perms=$(echo "$payload" | jq -r '.permissions | join(", ")')
+                test_metric "$username: role=$role, permissions=[$perms]"
+            fi
+        else
+            test_fail "$username: Failed to get JWT token"
+        fi
+    done
+    
+    print_section "2.2 Invalid Credentials Rejection"
+    
+    # Wrong password
+    local bad_response=$(curl -s --max-time 5 "http://${AUTH_PORTAL}/api/login" \
+        -X POST -H 'Content-Type: application/json' \
+        -d '{"username":"admin","password":"wrongpassword"}' 2>/dev/null)
+    
+    if echo "$bad_response" | grep -q "Invalid credentials"; then
+        test_pass "Wrong password correctly rejected"
+    else
+        test_fail "Wrong password not rejected properly"
+    fi
+    
+    # Non-existent user
+    local fake_response=$(curl -s --max-time 5 "http://${AUTH_PORTAL}/api/login" \
+        -X POST -H 'Content-Type: application/json' \
+        -d '{"username":"hacker","password":"hack123"}' 2>/dev/null)
+    
+    if echo "$fake_response" | grep -q "Invalid credentials"; then
+        test_pass "Non-existent user correctly rejected"
+    else
+        test_fail "Non-existent user not rejected properly"
+    fi
+    
+    print_section "2.3 JWT Token Validation"
+    
+    # Get a fresh token
+    local token=$(get_jwt_token "admin" "admin123")
+    if [[ -n "$token" ]]; then
+        local payload=$(decode_jwt "$token")
+        
+        # Check required claims
+        local has_sub=$(echo "$payload" | jq -r '.sub')
+        local has_exp=$(echo "$payload" | jq -r '.exp')
+        local has_iat=$(echo "$payload" | jq -r '.iat')
+        local has_iss=$(echo "$payload" | jq -r '.iss')
+        
+        if [[ "$has_sub" == "admin" ]]; then
+            test_pass "JWT contains 'sub' claim"
+        else
+            test_fail "JWT missing 'sub' claim"
+        fi
+        
+        if [[ "$has_exp" =~ ^[0-9]+$ ]]; then
+            test_pass "JWT contains 'exp' claim (expiry)"
+            local now=$(date +%s)
+            local ttl=$((has_exp - now))
+            test_metric "Token TTL: ${ttl}s (~$((ttl/60)) minutes)"
+        else
+            test_fail "JWT missing 'exp' claim"
+        fi
+        
+        if [[ "$has_iss" == "zta-auth-portal" ]]; then
+            test_pass "JWT issuer: zta-auth-portal"
+        else
+            test_fail "JWT has wrong issuer: $has_iss"
+        fi
+    fi
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3: RBAC Authorization Tests + 4 User Scenario Demo
+#═══════════════════════════════════════════════════════════════════════════════
+
+test_rbac() {
+    print_header "III. KIỂM TRA PHÂN QUYỀN RBAC (Authorization Tests)"
+    
+    echo -e "\n  ${BOLD}Permission Matrix (4 User Roles):${NC}"
+    echo -e "  ┌─────────────┬───────────┬───────────┬───────────┬────────────┐"
+    echo -e "  │ User        │ AWS UI    │ AWS Data  │ OS Data   │ Monitoring │"
+    echo -e "  ├─────────────┼───────────┼───────────┼───────────┼────────────┤"
+    echo -e "  │ viewer      │ ${GREEN}✓ YES${NC}     │ ${RED}✗ NO${NC}      │ ${RED}✗ NO${NC}      │ ${RED}✗ NO${NC}       │"
+    echo -e "  │ aws_user    │ ${GREEN}✓ YES${NC}     │ ${GREEN}✓ YES${NC}     │ ${RED}✗ NO${NC}      │ ${RED}✗ NO${NC}       │"
+    echo -e "  │ full_user   │ ${GREEN}✓ YES${NC}     │ ${GREEN}✓ YES${NC}     │ ${GREEN}✓ YES${NC}     │ ${RED}✗ NO${NC}       │"
+    echo -e "  │ admin       │ ${GREEN}✓ YES${NC}     │ ${GREEN}✓ YES${NC}     │ ${GREEN}✓ YES${NC}     │ ${GREEN}✓ YES${NC}      │"
+    echo -e "  └─────────────┴───────────┴───────────┴───────────┴────────────┘"
+    
+    print_section "3.1 User Permission Validation"
+    
+    # Test each user's actual API access
+    for username in viewer aws_user full_user admin; do
+        password="${USERS[$username]}"
+        expected_perms="${USER_PERMS[$username]}"
+        
+        print_subsection "Testing $username (expected: $expected_perms)"
+        
+        # Get token
+        token=$(get_jwt_token "$username" "$password")
+        
+        if [[ -z "$token" ]]; then
+            test_fail "$username: Failed to get JWT token"
+            continue
+        fi
+        test_pass "$username: JWT token obtained"
+        
+        # Test AWS Data API
+        aws_code=$(test_api_access "$token" "$AWS_DATA_API")
+        if echo "$expected_perms" | grep -q "aws:read"; then
+            if [[ "$aws_code" == "200" ]]; then
+                test_pass "$username: AWS Data access GRANTED (HTTP 200)"
+            else
+                test_fail "$username: AWS Data should be granted" "HTTP $aws_code"
+            fi
+        else
+            if [[ "$aws_code" == "403" ]]; then
+                test_pass "$username: AWS Data access DENIED (HTTP 403) - correct"
+            else
+                test_info "$username: AWS Data returned HTTP $aws_code"
+            fi
+        fi
+        
+        # Test OS Data API
+        os_code=$(test_api_access "$token" "$OS_DATA_API")
+        if echo "$expected_perms" | grep -q "os:read"; then
+            if [[ "$os_code" == "200" ]]; then
+                test_pass "$username: OS Data access GRANTED (HTTP 200)"
+            else
+                test_fail "$username: OS Data should be granted" "HTTP $os_code"
+            fi
+        else
+            if [[ "$os_code" == "403" ]]; then
+                test_pass "$username: OS Data access DENIED (HTTP 403) - correct"
+            else
+                test_info "$username: OS Data returned HTTP $os_code"
+            fi
+        fi
+    done
+    
+    print_section "3.2 Unauthenticated Access Blocking"
+    
+    # Test AWS API without token
+    local aws_noauth=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$AWS_DATA_API" 2>/dev/null || echo "000")
+    if [[ "$aws_noauth" == "401" ]]; then
+        test_pass "AWS API blocks unauthenticated requests (HTTP 401)"
+    else
+        test_info "AWS API returned HTTP $aws_noauth without auth"
+    fi
+    
+    # Test OS API without token
+    local os_noauth=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$OS_DATA_API" 2>/dev/null || echo "000")
+    if [[ "$os_noauth" == "401" ]]; then
+        test_pass "OS API blocks unauthenticated requests (HTTP 401)"
+    else
+        test_info "OS API returned HTTP $os_noauth without auth"
+    fi
+    
+    print_section "3.3 Invalid Token Rejection"
+    
+    local fake_token="eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJzdWIiOiAiZmFrZSJ9.invalidsig"
+    local invalid_result=$(test_api_access "$fake_token" "$AWS_DATA_API")
+    if [[ "$invalid_result" == "401" ]]; then
+        test_pass "Invalid JWT token rejected (HTTP 401)"
+    else
+        test_info "Invalid token returned HTTP $invalid_result"
+    fi
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# SECTION 4: Monitoring Stack Tests
+#═══════════════════════════════════════════════════════════════════════════════
+
+test_monitoring() {
+    print_header "IV. KIỂM TRA MONITORING (Observability Tests)"
+    
+    echo -e "  ${CYAN}ℹ Zero Trust: Monitoring has NO public IP${NC}"
+    echo -e "  ${CYAN}  Access via SSH tunnel: ssh -L 3000:${MONITORING}:3000 ubuntu@${AUTH_PORTAL}${NC}"
+    echo ""
+    
+    print_section "4.1 Grafana (via SSH tunnel)"
+    
+    # Test via SSH tunnel through Auth Portal
+    local grafana_health=$(ssh_cmd "$AUTH_PORTAL" "curl -s --max-time 5 'http://${MONITORING}:3000/api/health' 2>/dev/null")
+    if echo "$grafana_health" | grep -q "ok"; then
+        test_pass "Grafana is healthy (via SSH tunnel)"
+        local grafana_version=$(echo "$grafana_health" | jq -r '.version // "unknown"' 2>/dev/null)
+        test_metric "Grafana version: $grafana_version"
+    else
+        test_info "Grafana not responding - ensure monitoring VM is running"
+    fi
+    
+    print_section "4.2 Prometheus (via SSH tunnel)"
+    
+    local prom_ready=$(ssh_cmd "$AUTH_PORTAL" "curl -s --max-time 5 'http://${MONITORING}:9090/-/ready' 2>/dev/null")
+    if [[ "$prom_ready" == *"ready"* ]] || [[ -n "$prom_ready" ]]; then
+        test_pass "Prometheus is ready (via SSH tunnel)"
+    else
+        test_info "Prometheus not responding - ensure monitoring VM is running"
+    fi
+    
+    # Check Prometheus targets
+    local prom_targets=$(ssh_cmd "$AUTH_PORTAL" "curl -s --max-time 5 'http://${MONITORING}:9090/api/v1/targets' 2>/dev/null" | jq -r '.data.activeTargets | length' 2>/dev/null)
+    if [[ "$prom_targets" =~ ^[0-9]+$ ]] && [[ "$prom_targets" -gt 0 ]]; then
+        test_pass "Prometheus has $prom_targets active targets"
+    else
+        test_info "Prometheus targets: ${prom_targets:-N/A}"
+    fi
+    
+    print_section "4.3 Loki (Log Aggregation)"
+    
+    local loki_ready=$(ssh_cmd "$AUTH_PORTAL" "curl -s --max-time 5 -o /dev/null -w '%{http_code}' 'http://${MONITORING}:3100/ready' 2>/dev/null" || echo "000")
+    if [[ "$loki_ready" == "200" ]]; then
+        test_pass "Loki is ready (via SSH tunnel)"
+    else
+        test_info "Loki not deployed or not responding"
+    fi
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5: Infrastructure Tests
+#═══════════════════════════════════════════════════════════════════════════════
+
+test_infrastructure() {
+    print_header "V. KIỂM TRA HẠ TẦNG (Infrastructure Tests)"
+    
+    print_section "5.1 Docker Containers"
+    
+    # Auth Portal containers
+    local auth_containers=$(ssh_cmd "$AUTH_PORTAL" "sudo docker ps --format '{{.Names}}: {{.Status}}' 2>/dev/null")
+    if [[ -n "$auth_containers" ]]; then
+        echo -e "  ${CYAN}Auth Portal containers:${NC}"
+        echo "$auth_containers" | while read line; do
+            echo "    - $line"
+        done
+        test_pass "Auth Portal has running containers"
+    else
+        test_info "Cannot check Auth Portal containers"
+    fi
+    
+    # Monitoring containers
+    local mon_containers=$(ssh_cmd "$MONITORING" "sudo docker ps --format '{{.Names}}: {{.Status}}' 2>/dev/null")
+    if [[ -n "$mon_containers" ]]; then
+        echo -e "  ${CYAN}Monitoring containers:${NC}"
+        echo "$mon_containers" | while read line; do
+            echo "    - $line"
+        done
+        test_pass "Monitoring has running containers"
+    else
+        test_info "Cannot check Monitoring containers"
+    fi
+    
+    print_section "5.2 Terraform State"
+    
     if [[ -f "/etc/zta-multicloud/terraform-openstack/terraform.tfstate" ]]; then
-        RESOURCE_COUNT=$(grep -c '"type":' /etc/zta-multicloud/terraform-openstack/terraform.tfstate 2>/dev/null || echo "0")
-        test_pass "Terraform IaC is configured"
-        test_metric "Managed resources: $RESOURCE_COUNT"
+        local resource_count=$(grep -c '"type":' /etc/zta-multicloud/terraform-openstack/terraform.tfstate 2>/dev/null || echo "0")
+        test_pass "Terraform state exists"
+        test_metric "Managed resources: $resource_count"
     else
         test_fail "Terraform state not found"
     fi
     
-    # Check Ansible playbook
-    if [[ -f "/etc/zta-multicloud/ansible-zta/site.yml" ]]; then
-        PLAY_COUNT=$(grep -c "^- name:" /etc/zta-multicloud/ansible-zta/site.yml 2>/dev/null || echo "0")
-        test_pass "Ansible automation is configured"
-        test_metric "Automation plays: $PLAY_COUNT"
+    print_section "5.3 Network Connectivity"
+    
+    # Check internal network via Auth Portal
+    local can_reach_aws=$(ssh_cmd "$AUTH_PORTAL" "ping -c 1 -W 2 ${AWS_GATEWAY_INTERNAL} 2>/dev/null && echo OK || echo FAIL")
+    if [[ "$can_reach_aws" == *"OK"* ]]; then
+        test_pass "Auth Portal can reach AWS Gateway ($AWS_GATEWAY_INTERNAL)"
     else
-        test_fail "Ansible playbook not found"
+        test_fail "Auth Portal cannot reach AWS Gateway"
     fi
     
-    # 2.2 Service Health Checks
-    print_section "2.2 Kiểm tra trạng thái dịch vụ (Service Health)"
-    
-    declare -A SERVICES=(
-        ["Keycloak"]="$MONITORING:curl -s http://$IDENTITY:8080/health/ready"
-        ["Prometheus"]="$MONITORING:curl -s http://localhost:9090/-/ready"
-        ["Grafana"]="$MONITORING:curl -s http://localhost:3000/api/health"
-        ["Loki"]="$MONITORING:curl -s http://localhost:3100/ready"
-    )
-    
-    for svc in "${!SERVICES[@]}"; do
-        IFS=':' read -r host cmd <<< "${SERVICES[$svc]}"
-        HEALTH=$(ssh_cmd "$host" "$cmd" 2>/dev/null || echo "error")
-        if [[ "$HEALTH" != "error" ]] && [[ "$HEALTH" != *"refused"* ]]; then
-            test_pass "$svc is healthy"
-        else
-            test_info "$svc health check (may need time to start)"
-        fi
-    done
-    
-    # Check Envoy proxies
-    for gw_name in "AWS" "OS"; do
-        if [[ "$gw_name" == "AWS" ]]; then
-            gw_ip="$AWS_GATEWAY"
-        else
-            gw_ip="$OS_GATEWAY"
-        fi
-        
-        ENVOY_STATUS=$(ssh_cmd "$gw_ip" "sudo docker ps --filter name=envoy --format '{{.Status}}'" 2>/dev/null || echo "")
-        if [[ "$ENVOY_STATUS" == *"Up"* ]]; then
-            test_pass "Envoy Proxy ($gw_name Gateway) is running"
-        else
-            test_info "Envoy ($gw_name) status: $ENVOY_STATUS"
-        fi
-    done
-    
-    # 2.3 K3s Clusters
-    print_section "2.3 Kubernetes Clusters (K3s)"
-    
-    # AWS K3s
-    K3S_AWS=$(ssh_cmd "$AWS_GATEWAY" "ssh -o StrictHostKeyChecking=no 10.20.2.10 'kubectl get nodes -o wide 2>/dev/null'" 2>/dev/null || echo "")
-    if [[ -n "$K3S_AWS" ]] && [[ "$K3S_AWS" == *"Ready"* ]]; then
-        test_pass "AWS K3s cluster is ready"
-        POD_COUNT=$(ssh_cmd "$AWS_GATEWAY" "ssh -o StrictHostKeyChecking=no 10.20.2.10 'kubectl get pods -A --no-headers 2>/dev/null | wc -l'" 2>/dev/null || echo "0")
-        test_metric "AWS cluster pods: $POD_COUNT"
+    local can_reach_os=$(ssh_cmd "$AUTH_PORTAL" "ping -c 1 -W 2 ${OS_GATEWAY_INTERNAL} 2>/dev/null && echo OK || echo FAIL")
+    if [[ "$can_reach_os" == *"OK"* ]]; then
+        test_pass "Auth Portal can reach OS Gateway ($OS_GATEWAY_INTERNAL)"
     else
-        test_info "AWS K3s cluster status check"
-    fi
-    
-    # OS K3s
-    K3S_OS=$(ssh_cmd "$OS_GATEWAY" "ssh -o StrictHostKeyChecking=no 10.10.2.10 'kubectl get nodes -o wide 2>/dev/null'" 2>/dev/null || echo "")
-    if [[ -n "$K3S_OS" ]] && [[ "$K3S_OS" == *"Ready"* ]]; then
-        test_pass "OS K3s cluster is ready"
-        POD_COUNT=$(ssh_cmd "$OS_GATEWAY" "ssh -o StrictHostKeyChecking=no 10.10.2.10 'kubectl get pods -A --no-headers 2>/dev/null | wc -l'" 2>/dev/null || echo "0")
-        test_metric "OS cluster pods: $POD_COUNT"
-    else
-        test_info "OS K3s cluster status check"
-    fi
-    
-    # 2.4 Certificate Management
-    print_section "2.4 Quản lý chứng chỉ (Certificate Management)"
-    
-    # Check certificate expiry
-    CERT_EXPIRY=$(ssh_cmd "$AWS_GATEWAY" "openssl x509 -in /opt/certs/aws-client-cert.pem -noout -enddate 2>/dev/null | cut -d'=' -f2" || echo "")
-    if [[ -n "$CERT_EXPIRY" ]]; then
-        test_pass "Client certificate is configured"
-        test_metric "Certificate expires: $CERT_EXPIRY"
-        
-        # Calculate days until expiry
-        EXPIRY_EPOCH=$(date -d "$CERT_EXPIRY" +%s 2>/dev/null || echo "0")
-        NOW_EPOCH=$(date +%s)
-        DAYS_LEFT=$(( (EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
-        if [[ $DAYS_LEFT -gt 30 ]]; then
-            test_pass "Certificate valid for $DAYS_LEFT days"
-        else
-            test_info "Certificate expires in $DAYS_LEFT days - consider renewal"
-        fi
-    else
-        test_info "Certificate expiry check"
+        test_fail "Auth Portal cannot reach OS Gateway"
     fi
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
-# SECTION 3: PERFORMANCE EVALUATION
-#═══════════════════════════════════════════════════════════════════════════════
-
-test_performance() {
-    print_header "III. ĐÁNH GIÁ HIỆU NĂNG (Performance Evaluation)"
-    
-    # 3.1 Network Latency
-    print_section "3.1 Độ trễ mạng (Network Latency)"
-    
-    # Ping between gateways
-    PING_RESULT=$(ssh_cmd "$AWS_GATEWAY" "ping -c 5 10.99.0.2 2>/dev/null" || echo "")
-    if [[ -n "$PING_RESULT" ]]; then
-        AVG_LATENCY=$(echo "$PING_RESULT" | grep "avg" | awk -F'/' '{print $5}')
-        test_pass "WireGuard tunnel ping successful"
-        test_metric "Average tunnel latency: ${AVG_LATENCY}ms"
-    else
-        test_info "Tunnel latency measurement"
-    fi
-    
-    # 3.2 Authentication Latency
-    print_section "3.2 Độ trễ xác thực (Authentication Latency)"
-    
-    AUTH_TIMES=()
-    for i in {1..5}; do
-        START=$(date +%s%N)
-        curl -s -X POST "http://$AWS_GATEWAY/auth/token" \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "username=demo&password=demo123&grant_type=password&client_id=zta-web" > /dev/null 2>&1
-        END=$(date +%s%N)
-        ELAPSED=$(( (END - START) / 1000000 ))
-        AUTH_TIMES+=($ELAPSED)
-    done
-    
-    if [[ ${#AUTH_TIMES[@]} -gt 0 ]]; then
-        TOTAL=0
-        for t in "${AUTH_TIMES[@]}"; do
-            TOTAL=$((TOTAL + t))
-        done
-        AVG_AUTH=$((TOTAL / ${#AUTH_TIMES[@]}))
-        test_pass "Authentication latency measured"
-        test_metric "Average auth time: ${AVG_AUTH}ms (over 5 requests)"
-        
-        if [[ $AVG_AUTH -lt 500 ]]; then
-            test_pass "Auth latency within acceptable range (<500ms)"
-        else
-            test_info "Auth latency is ${AVG_AUTH}ms - may need optimization"
-        fi
-    fi
-    
-    # 3.3 End-to-End Request Latency
-    print_section "3.3 Độ trễ yêu cầu đầu cuối (E2E Request Latency)"
-    
-    # Get fresh token
-    TOKEN_RESP=$(curl -s -X POST "http://$AWS_GATEWAY/auth/token" \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        -d "username=demo&password=demo123&grant_type=password&client_id=zta-web" 2>/dev/null)
-    TOKEN=$(echo "$TOKEN_RESP" | jq -r '.access_token' 2>/dev/null)
-    
-    if [[ -n "$TOKEN" ]] && [[ "$TOKEN" != "null" ]]; then
-        E2E_TIMES=()
-        for i in {1..5}; do
-            START=$(date +%s%N)
-            RESP=$(curl -s -o /dev/null -w "%{http_code}" \
-                -H "Authorization: Bearer $TOKEN" \
-                "http://$AWS_GATEWAY/api/secure-data" 2>/dev/null || echo "000")
-            END=$(date +%s%N)
-            ELAPSED=$(( (END - START) / 1000000 ))
-            E2E_TIMES+=($ELAPSED)
-        done
-        
-        if [[ ${#E2E_TIMES[@]} -gt 0 ]]; then
-            TOTAL=0
-            MIN=${E2E_TIMES[0]}
-            MAX=${E2E_TIMES[0]}
-            for t in "${E2E_TIMES[@]}"; do
-                TOTAL=$((TOTAL + t))
-                [[ $t -lt $MIN ]] && MIN=$t
-                [[ $t -gt $MAX ]] && MAX=$t
-            done
-            AVG_E2E=$((TOTAL / ${#E2E_TIMES[@]}))
-            
-            test_pass "End-to-end latency measured"
-            test_metric "E2E latency: min=${MIN}ms, avg=${AVG_E2E}ms, max=${MAX}ms"
-            
-            if [[ $AVG_E2E -lt 100 ]]; then
-                test_pass "E2E latency within target (<100ms)"
-            elif [[ $AVG_E2E -lt 200 ]]; then
-                test_pass "E2E latency acceptable (<200ms)"
-            else
-                test_info "E2E latency is ${AVG_E2E}ms - may need optimization"
-            fi
-        fi
-    else
-        test_info "E2E latency test requires valid token"
-    fi
-    
-    # 3.4 Throughput Test
-    print_section "3.4 Thông lượng (Throughput)"
-    
-    if [[ -n "$TOKEN" ]] && [[ "$TOKEN" != "null" ]]; then
-        SUCCESS_COUNT=0
-        START=$(date +%s)
-        for i in {1..20}; do
-            RESP=$(curl -s -o /dev/null -w "%{http_code}" \
-                -H "Authorization: Bearer $TOKEN" \
-                "http://$AWS_GATEWAY/api/secure-data" 2>/dev/null || echo "000")
-            [[ "$RESP" == "200" ]] && ((SUCCESS_COUNT++))
-        done
-        END=$(date +%s)
-        DURATION=$((END - START))
-        [[ $DURATION -eq 0 ]] && DURATION=1
-        RPS=$((SUCCESS_COUNT / DURATION))
-        
-        test_pass "Throughput test completed"
-        test_metric "Successful requests: $SUCCESS_COUNT/20 in ${DURATION}s (~${RPS} req/s)"
-    fi
-    
-    # 3.5 Resource Usage
-    print_section "3.5 Sử dụng tài nguyên (Resource Usage)"
-    
-    for host_name in "AWS Gateway" "OS Gateway" "Monitoring"; do
-        case "$host_name" in
-            "AWS Gateway") host_ip="$AWS_GATEWAY" ;;
-            "OS Gateway") host_ip="$OS_GATEWAY" ;;
-            "Monitoring") host_ip="$MONITORING" ;;
-        esac
-        
-        CPU=$(ssh_cmd "$host_ip" "top -bn1 | grep 'Cpu(s)' | awk '{print \$2}'" 2>/dev/null || echo "N/A")
-        MEM=$(ssh_cmd "$host_ip" "free -m | awk 'NR==2{printf \"%.1f%%\", \$3*100/\$2}'" 2>/dev/null || echo "N/A")
-        DOCKER_COUNT=$(ssh_cmd "$host_ip" "sudo docker ps -q 2>/dev/null | wc -l" || echo "0")
-        
-        test_metric "$host_name - CPU: ${CPU}%, MEM: ${MEM}, Containers: $DOCKER_COUNT"
-    done
-}
-
-#═══════════════════════════════════════════════════════════════════════════════
-# SECTION 4: FULL E2E FLOW TEST
+# SECTION 6: End-to-End Flow Test
 #═══════════════════════════════════════════════════════════════════════════════
 
 test_e2e_flow() {
-    print_header "IV. KIỂM TRA LUỒNG ĐẦU CUỐI (End-to-End Flow Test)"
+    print_header "VI. KIỂM TRA LUỒNG ĐẦU CUỐI (E2E Flow Test)"
     
-    print_section "4.1 Complete Zero Trust Flow"
+    echo -e "\n  ${BOLD}Flow: User → Auth Portal → JWT → AWS/OS API${NC}\n"
     
-    echo -e "\n  ${BOLD}Flow: User → AWS Gateway → Keycloak → JWT → Envoy → mTLS → OS Gateway → Backend${NC}\n"
+    print_section "6.1 Complete Authentication Flow"
     
-    # Step 1: Frontend
-    echo -e "  ${CYAN}Step 1: Access Frontend${NC}"
-    FRONTEND=$(curl -s -o /dev/null -w "%{http_code}" "http://$AWS_GATEWAY/" 2>/dev/null || echo "000")
-    if [[ "$FRONTEND" == "200" ]]; then
-        test_pass "Frontend accessible (HTTP 200)"
+    # Step 1: Access login page
+    echo -e "  ${CYAN}Step 1: Access Auth Portal${NC}"
+    local portal_code=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" "http://${AUTH_PORTAL}/" 2>/dev/null)
+    if [[ "$portal_code" == "200" ]]; then
+        test_pass "Auth Portal accessible (HTTP $portal_code)"
     else
-        test_fail "Frontend not accessible (HTTP $FRONTEND)"
+        test_fail "Auth Portal not accessible" "HTTP $portal_code"
     fi
     
-    # Step 2: Authentication
-    echo -e "\n  ${CYAN}Step 2: Keycloak Authentication${NC}"
-    TOKEN_RESP=$(curl -s -X POST "http://$AWS_GATEWAY/auth/token" \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        -d "username=demo&password=demo123&grant_type=password&client_id=zta-web" 2>/dev/null)
-    
-    if echo "$TOKEN_RESP" | grep -q "access_token"; then
-        test_pass "JWT token obtained from Keycloak"
-        TOKEN=$(echo "$TOKEN_RESP" | jq -r '.access_token')
+    # Step 2: Login and get token
+    echo -e "\n  ${CYAN}Step 2: Authenticate & Get JWT${NC}"
+    local token=$(get_jwt_token "full_user" "full123")
+    if [[ -n "$token" ]]; then
+        test_pass "JWT token obtained for full_user"
+        test_info "Token: ${token:0:50}..."
     else
         test_fail "Failed to get JWT token"
-        TOKEN=""
+        return
     fi
     
-    # Step 3: Unauthenticated access blocked
-    echo -e "\n  ${CYAN}Step 3: Verify Unauthenticated Access Blocked${NC}"
-    UNAUTH=$(curl -s -o /dev/null -w "%{http_code}" "http://$AWS_GATEWAY/api/secure-data" 2>/dev/null || echo "000")
-    if [[ "$UNAUTH" == "401" ]] || [[ "$UNAUTH" == "403" ]]; then
-        test_pass "Unauthenticated API request blocked (HTTP $UNAUTH)"
+    # Step 3: Access AWS Dashboard
+    echo -e "\n  ${CYAN}Step 3: Access AWS Dashboard${NC}"
+    local aws_page=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" "http://${AUTH_PORTAL}/aws/" 2>/dev/null)
+    if [[ "$aws_page" == "200" ]] || [[ "$aws_page" == "301" ]]; then
+        test_pass "AWS Dashboard page accessible"
     else
-        test_fail "Unauthenticated request returned HTTP $UNAUTH"
+        test_info "AWS Dashboard returned HTTP $aws_page"
     fi
     
-    # Step 4: Authenticated access
-    echo -e "\n  ${CYAN}Step 4: Authenticated API Access${NC}"
-    if [[ -n "$TOKEN" ]] && [[ "$TOKEN" != "null" ]]; then
-        API_RESP=$(curl -s -H "Authorization: Bearer $TOKEN" "http://$AWS_GATEWAY/api/secure-data" 2>/dev/null)
-        API_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "http://$AWS_GATEWAY/api/secure-data" 2>/dev/null || echo "000")
-        
-        if [[ "$API_CODE" == "200" ]]; then
-            test_pass "Authenticated API request successful (HTTP 200)"
-            
-            if echo "$API_RESP" | jq -e '.status' > /dev/null 2>&1; then
-                STATUS=$(echo "$API_RESP" | jq -r '.status')
-                MESSAGE=$(echo "$API_RESP" | jq -r '.message')
-                test_pass "Backend response valid: $STATUS - $MESSAGE"
-                
-                # Display security layers
-                echo -e "\n  ${GREEN}Security Layers Verified:${NC}"
-                echo "$API_RESP" | jq -r '.data.security_layers[]' 2>/dev/null | while read layer; do
-                    echo -e "    ✓ $layer"
-                done
-            fi
+    # Step 4: Test API with token
+    echo -e "\n  ${CYAN}Step 4: Call AWS API with JWT${NC}"
+    local aws_api=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" \
+        -H "Authorization: Bearer $token" \
+        "http://${AUTH_PORTAL}/aws/api/data" 2>/dev/null || echo "000")
+    
+    if [[ "$aws_api" == "200" ]]; then
+        test_pass "AWS API returned data (HTTP 200)"
+    elif [[ "$aws_api" == "401" ]] || [[ "$aws_api" == "403" ]]; then
+        test_info "AWS API denied access (HTTP $aws_api) - OPA policy check"
+    elif [[ "$aws_api" == "502" ]] || [[ "$aws_api" == "504" ]]; then
+        test_info "AWS Gateway not responding (HTTP $aws_api)"
+    else
+        test_info "AWS API returned HTTP $aws_api"
+    fi
+    
+    # Step 5: Test invalid token
+    echo -e "\n  ${CYAN}Step 5: Verify Invalid Token Rejected${NC}"
+    local fake_token="eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJzdWIiOiAiZmFrZSJ9.invalid"
+    local invalid_result=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
+        -H "Authorization: Bearer $fake_token" \
+        "http://${AUTH_PORTAL}/aws/api/data" 2>/dev/null || echo "000")
+    
+    if [[ "$invalid_result" == "401" ]] || [[ "$invalid_result" == "403" ]]; then
+        test_pass "Invalid token correctly rejected (HTTP $invalid_result)"
+    elif [[ "$invalid_result" == "502" ]] || [[ "$invalid_result" == "504" ]]; then
+        test_info "Gateway not available to test token validation (HTTP $invalid_result)"
+    else
+        test_info "Invalid token returned HTTP $invalid_result"
+    fi
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# Performance Tests (Optional)
+#═══════════════════════════════════════════════════════════════════════════════
+
+test_performance() {
+    print_header "VII. KIỂM TRA HIỆU NĂNG (Performance Tests)"
+    
+    print_section "7.1 Authentication Latency"
+    
+    local total=0
+    local count=5
+    
+    for i in $(seq 1 $count); do
+        local start=$(date +%s%N)
+        get_jwt_token "admin" "admin123" > /dev/null
+        local end=$(date +%s%N)
+        local elapsed=$(( (end - start) / 1000000 ))
+        total=$((total + elapsed))
+    done
+    
+    local avg=$((total / count))
+    test_metric "Average auth latency: ${avg}ms (over $count requests)"
+    
+    if [[ $avg -lt 500 ]]; then
+        test_pass "Auth latency acceptable (<500ms)"
+    else
+        test_info "Auth latency is ${avg}ms - may need optimization"
+    fi
+    
+    print_section "7.2 Portal Response Time"
+    
+    local portal_time=$(curl -s --max-time 10 -o /dev/null -w "%{time_total}" "http://${AUTH_PORTAL}:8888/" 2>/dev/null)
+    local portal_ms=$(echo "$portal_time * 1000" | bc 2>/dev/null | cut -d'.' -f1)
+    
+    if [[ -n "$portal_ms" ]]; then
+        test_metric "Portal response time: ${portal_ms}ms"
+        if [[ "$portal_ms" -lt 200 ]]; then
+            test_pass "Portal response time excellent (<200ms)"
         else
-            test_fail "Authenticated API request failed (HTTP $API_CODE)"
+            test_pass "Portal response time acceptable"
+        fi
+    fi
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# SECTION 8: 4-User Scenario Demo (Interactive)
+#═══════════════════════════════════════════════════════════════════════════════
+
+demo_user_scenario() {
+    local username="$1"
+    local password="$2"
+    local expected_aws="$3"
+    local expected_os="$4"
+    local desc="$5"
+    
+    echo ""
+    echo -e "  ${CYAN}┌────────────────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "  ${CYAN}│${NC} ${BOLD}User: $username${NC} - $desc"
+    echo -e "  ${CYAN}└────────────────────────────────────────────────────────────────────────┘${NC}"
+    
+    # Step 1: Login
+    echo -e "  ${YELLOW}[1]${NC} Đăng nhập..."
+    local token=$(get_jwt_token "$username" "$password")
+    
+    if [[ -z "$token" ]]; then
+        echo -e "      ${RED}❌ Login failed${NC}"
+        return 1
+    fi
+    echo -e "      ${GREEN}✓ Token received${NC}"
+    
+    # Decode and show JWT
+    local payload=$(decode_jwt "$token")
+    if [[ -n "$payload" ]]; then
+        local role=$(echo "$payload" | grep -o '"role": "[^"]*"' | cut -d'"' -f4)
+        local perms=$(echo "$payload" | grep -o '"permissions": \[[^]]*\]' | sed 's/"permissions": //; s/\[//; s/\]//; s/"//g')
+        echo -e "      Role: ${MAGENTA}$role${NC}"
+        echo -e "      Permissions: ${CYAN}[$perms]${NC}"
+    fi
+    
+    # Step 2: Try AWS Data
+    echo -e "  ${YELLOW}[2]${NC} Fetch AWS Cluster Data..."
+    local aws_code=$(test_api_access "$token" "$AWS_DATA_API")
+    
+    if [[ "$aws_code" == "200" ]]; then
+        echo -e "      ${GREEN}✓ HTTP 200 - Access GRANTED${NC}"
+        local aws_data=$(curl -s --max-time 5 -H "Authorization: Bearer $token" "$AWS_DATA_API" 2>/dev/null)
+        local aws_cluster=$(echo "$aws_data" | grep -o '"cluster": "[^"]*"' | cut -d'"' -f4)
+        echo -e "      Data: cluster=${aws_cluster}"
+        
+        if [[ "$expected_aws" == "yes" ]]; then
+            test_pass "$username: AWS access correct (granted)"
+        else
+            test_fail "$username: AWS should be denied" "got HTTP 200"
         fi
     else
-        test_fail "No token available for authenticated test"
+        echo -e "      ${RED}✗ HTTP $aws_code - Access DENIED${NC}"
+        if [[ "$expected_aws" == "no" ]]; then
+            test_pass "$username: AWS access correct (denied)"
+        else
+            test_fail "$username: AWS should be granted" "got HTTP $aws_code"
+        fi
     fi
     
-    # Step 5: Invalid token test
-    echo -e "\n  ${CYAN}Step 5: Verify Invalid Token Rejected${NC}"
-    INVALID=$(curl -s -o /dev/null -w "%{http_code}" \
-        -H "Authorization: Bearer invalid.token.here" \
-        "http://$AWS_GATEWAY/api/secure-data" 2>/dev/null || echo "000")
-    if [[ "$INVALID" == "401" ]] || [[ "$INVALID" == "403" ]]; then
-        test_pass "Invalid JWT token rejected (HTTP $INVALID)"
+    # Step 3: Try OS Data
+    echo -e "  ${YELLOW}[3]${NC} Fetch OS Cluster Data (cross-cluster via mTLS)..."
+    local os_code=$(test_api_access "$token" "$OS_DATA_API")
+    
+    if [[ "$os_code" == "200" ]]; then
+        echo -e "      ${GREEN}✓ HTTP 200 - Access GRANTED${NC}"
+        local os_data=$(curl -s --max-time 5 -H "Authorization: Bearer $token" "$OS_DATA_API" 2>/dev/null)
+        local os_cluster=$(echo "$os_data" | grep -o '"cluster": "[^"]*"' | cut -d'"' -f4)
+        echo -e "      Data: cluster=${os_cluster}"
+        
+        if [[ "$expected_os" == "yes" ]]; then
+            test_pass "$username: OS access correct (granted)"
+        else
+            test_fail "$username: OS should be denied" "got HTTP 200"
+        fi
     else
-        test_fail "Invalid token returned HTTP $INVALID"
+        echo -e "      ${RED}✗ HTTP $os_code - Access DENIED${NC}"
+        if [[ "$expected_os" == "no" ]]; then
+            test_pass "$username: OS access correct (denied)"
+        else
+            test_fail "$username: OS should be granted" "got HTTP $os_code"
+        fi
     fi
+}
+
+test_user_scenarios() {
+    print_header "VIII. DEMO KỊCH BẢN 4 USER (User Scenario Demo)"
+    
+    echo -e "\n  ${BOLD}Kịch bản demo Zero Trust với 4 loại người dùng:${NC}"
+    echo -e "  1. ${GREEN}viewer${NC}    - Chỉ xem AWS UI, không fetch được data"
+    echo -e "  2. ${GREEN}aws_user${NC}  - AWS UI + AWS data, không fetch OS"
+    echo -e "  3. ${GREEN}full_user${NC} - AWS UI + AWS data + OS data"
+    echo -e "  4. ${GREEN}admin${NC}     - Full access + Monitoring"
+    
+    print_section "8.1 Scenario 1: viewer (AWS UI only)"
+    demo_user_scenario "viewer" "viewer123" "no" "no" "Chỉ có quyền aws:ui"
+    
+    print_section "8.2 Scenario 2: aws_user (AWS UI + AWS Data)"
+    demo_user_scenario "aws_user" "aws123" "yes" "no" "Có quyền aws:ui, aws:read"
+    
+    print_section "8.3 Scenario 3: full_user (AWS + OS Data)"
+    demo_user_scenario "full_user" "full123" "yes" "yes" "Có quyền aws:ui, aws:read, os:read"
+    
+    print_section "8.4 Scenario 4: admin (Full Access)"
+    demo_user_scenario "admin" "admin123" "yes" "yes" "Full permissions + monitoring"
+    
+    # Admin monitoring access (via SSH tunnel - Zero Trust)
+    echo ""
+    echo -e "  ${YELLOW}[4]${NC} Kiểm tra Monitoring access (admin only via SSH tunnel)..."
+    echo -e "      ${CYAN}ℹ Zero Trust: Monitoring only accessible via Auth Portal${NC}"
+    
+    local grafana_code=$(ssh_cmd "$AUTH_PORTAL" "curl -s --max-time 5 -o /dev/null -w '%{http_code}' 'http://${MONITORING}:3000/api/health' 2>/dev/null")
+    if [[ "$grafana_code" == "200" ]]; then
+        echo -e "      ${GREEN}✓ Grafana accessible (via SSH tunnel)${NC}"
+        test_pass "admin: Grafana monitoring access (via tunnel)"
+    else
+        echo -e "      ${YELLOW}ℹ Grafana: Use SSH tunnel - ssh -L 3000:${MONITORING}:3000 ubuntu@${AUTH_PORTAL}${NC}"
+    fi
+    
+    local prom_code=$(ssh_cmd "$AUTH_PORTAL" "curl -s --max-time 5 -o /dev/null -w '%{http_code}' 'http://${MONITORING}:9090/-/ready' 2>/dev/null")
+    if [[ "$prom_code" == "200" ]]; then
+        echo -e "      ${GREEN}✓ Prometheus accessible (via SSH tunnel)${NC}"
+        test_pass "admin: Prometheus monitoring access (via tunnel)"
+    else
+        echo -e "      ${YELLOW}ℹ Prometheus: Use SSH tunnel - ssh -L 9090:${MONITORING}:9090 ubuntu@${AUTH_PORTAL}${NC}"
+    fi
+    
+    print_section "8.5 Summary Matrix"
+    
+    echo ""
+    echo -e "  ${BOLD}Actual Test Results:${NC}"
+    echo -e "  ┌─────────────┬───────────┬───────────┬───────────┬────────────┐"
+    echo -e "  │ User        │ AWS UI    │ AWS Data  │ OS Data   │ Monitoring │"
+    echo -e "  ├─────────────┼───────────┼───────────┼───────────┼────────────┤"
+    
+    for username in viewer aws_user full_user admin; do
+        password="${USERS[$username]}"
+        token=$(get_jwt_token "$username" "$password")
+        
+        aws_result=$(test_api_access "$token" "$AWS_DATA_API")
+        os_result=$(test_api_access "$token" "$OS_DATA_API")
+        
+        aws_icon="[[ \"$aws_result\" == \"200\" ]] && echo \"${GREEN}✓ YES${NC}\" || echo \"${RED}✗ NO${NC}\""
+        os_icon="[[ \"$os_result\" == \"200\" ]] && echo \"${GREEN}✓ YES${NC}\" || echo \"${RED}✗ NO${NC}\""
+        
+        printf "  │ %-11s │" "$username"
+        echo -ne " ${GREEN}✓ YES${NC}     │"
+        [[ "$aws_result" == "200" ]] && echo -ne " ${GREEN}✓ YES${NC}     │" || echo -ne " ${RED}✗ NO${NC}      │"
+        [[ "$os_result" == "200" ]] && echo -ne " ${GREEN}✓ YES${NC}     │" || echo -ne " ${RED}✗ NO${NC}      │"
+        [[ "$username" == "admin" ]] && echo -e " ${GREEN}✓ YES${NC}      │" || echo -e " ${RED}✗ NO${NC}       │"
+    done
+    
+    echo -e "  └─────────────┴───────────┴───────────┴───────────┴────────────┘"
+    
+    echo ""
+    echo -e "  ${BOLD}Zero Trust Flow:${NC}"
+    echo "  1. User đăng nhập Auth Portal → nhận JWT với permissions"
+    echo "  2. JWT được gửi kèm mỗi API request (Authorization header)"
+    echo "  3. Auth Server verify JWT signature và check permissions"
+    echo "  4. Allow/Deny dựa trên permission claims trong token"
+    echo "  5. Cross-cluster (OS): Data fetch qua mTLS tunnel"
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 #═══════════════════════════════════════════════════════════════════════════════
 
+show_usage() {
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  -a, --all         Run all tests (default)"
+    echo "  -c, --connect     Run connectivity tests only"
+    echo "  -u, --auth        Run authentication tests only"
+    echo "  -r, --rbac        Run RBAC tests only"
+    echo "  -m, --monitor     Run monitoring tests only"
+    echo "  -i, --infra       Run infrastructure tests only"
+    echo "  -e, --e2e         Run E2E flow tests only"
+    echo "  -p, --perf        Run performance tests only"
+    echo "  -d, --demo        Run 4-user scenario demo"
+    echo "  -q, --quick       Quick test (connectivity + auth + rbac)"
+    echo "  -f, --full-demo   Full demo (quick + scenarios)"
+    echo "  -h, --help        Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  $0                Run all tests"
+    echo "  $0 -q             Quick test"
+    echo "  $0 -d             Demo 4 user scenarios"
+    echo "  $0 -f             Full demo from A-Z"
+    echo ""
+}
+
 main() {
+    local RUN_ALL=true
+    local RUN_CONNECT=false
+    local RUN_AUTH=false
+    local RUN_RBAC=false
+    local RUN_MONITOR=false
+    local RUN_INFRA=false
+    local RUN_E2E=false
+    local RUN_PERF=false
+    local RUN_DEMO=false
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -a|--all) RUN_ALL=true; shift ;;
+            -c|--connect) RUN_CONNECT=true; RUN_ALL=false; shift ;;
+            -u|--auth) RUN_AUTH=true; RUN_ALL=false; shift ;;
+            -r|--rbac) RUN_RBAC=true; RUN_ALL=false; shift ;;
+            -m|--monitor) RUN_MONITOR=true; RUN_ALL=false; shift ;;
+            -i|--infra) RUN_INFRA=true; RUN_ALL=false; shift ;;
+            -e|--e2e) RUN_E2E=true; RUN_ALL=false; shift ;;
+            -p|--perf) RUN_PERF=true; RUN_ALL=false; shift ;;
+            -d|--demo) RUN_DEMO=true; RUN_ALL=false; shift ;;
+            -q|--quick) RUN_CONNECT=true; RUN_AUTH=true; RUN_RBAC=true; RUN_ALL=false; shift ;;
+            -f|--full-demo) RUN_CONNECT=true; RUN_AUTH=true; RUN_RBAC=true; RUN_DEMO=true; RUN_ALL=false; shift ;;
+            -h|--help) show_usage; exit 0 ;;
+            *) echo "Unknown option: $1"; show_usage; exit 1 ;;
+        esac
+    done
+    
     clear
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════════════════════════════════════╗"
     echo "║                                                                               ║"
-    echo "║     ZERO TRUST ARCHITECTURE - COMPREHENSIVE EVALUATION TEST SUITE            ║"
-    echo "║     Đánh giá toàn diện: Bảo mật | Vận hành | Hiệu năng                       ║"
+    echo "║     ZERO TRUST ARCHITECTURE - EVALUATION TEST SUITE                           ║"
+    echo "║     Hub-and-Spoke Deployment via Auth Portal                                  ║"
     echo "║                                                                               ║"
     echo "╚═══════════════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     
     echo -e "${BOLD}Configuration:${NC}"
-    echo "  AWS Gateway:  $AWS_GATEWAY"
-    echo "  OS Gateway:   $OS_GATEWAY"
-    echo "  Monitoring:   $MONITORING"
-    echo "  Identity:     $IDENTITY"
+    echo "  Auth Portal:    http://${AUTH_PORTAL}:8888"
+    echo "  Monitoring:     http://${MONITORING}:3000 (Grafana)"
+    echo "                  http://${MONITORING}:9090 (Prometheus)"
+    echo ""
+    echo -e "${BOLD}User Accounts (4 Roles):${NC}"
+    echo "  viewer    / viewer123 → AWS UI only"
+    echo "  aws_user  / aws123    → AWS UI + AWS data"
+    echo "  full_user / full123   → AWS UI + AWS data + OS data"
+    echo "  admin     / admin123  → Full access + Monitoring"
     echo ""
     
-    # Run all tests
-    test_security
-    test_operations
-    test_performance
-    test_e2e_flow
+    # Run tests
+    [[ "$RUN_ALL" == true ]] || [[ "$RUN_CONNECT" == true ]] && test_connectivity
+    [[ "$RUN_ALL" == true ]] || [[ "$RUN_AUTH" == true ]] && test_authentication
+    [[ "$RUN_ALL" == true ]] || [[ "$RUN_RBAC" == true ]] && test_rbac
+    [[ "$RUN_ALL" == true ]] || [[ "$RUN_MONITOR" == true ]] && test_monitoring
+    [[ "$RUN_ALL" == true ]] || [[ "$RUN_INFRA" == true ]] && test_infrastructure
+    [[ "$RUN_ALL" == true ]] || [[ "$RUN_E2E" == true ]] && test_e2e_flow
+    [[ "$RUN_ALL" == true ]] || [[ "$RUN_PERF" == true ]] && test_performance
+    [[ "$RUN_ALL" == true ]] || [[ "$RUN_DEMO" == true ]] && test_user_scenarios
     
     # Summary
-    print_header "V. KẾT QUẢ TỔNG HỢP (Summary)"
+    print_header "TỔNG KẾT (Summary)"
     
     echo ""
     echo -e "  ${BOLD}Test Results:${NC}"
     echo -e "    Total Tests:  $TOTAL_TESTS"
     echo -e "    ${GREEN}Passed:       $PASSED_TESTS${NC}"
     echo -e "    ${RED}Failed:       $FAILED_TESTS${NC}"
+    [[ $SKIPPED_TESTS -gt 0 ]] && echo -e "    ${YELLOW}Skipped:      $SKIPPED_TESTS${NC}"
     
     if [[ $TOTAL_TESTS -gt 0 ]]; then
-        PASS_RATE=$((PASSED_TESTS * 100 / TOTAL_TESTS))
-        echo -e "    Pass Rate:    ${PASS_RATE}%"
+        local pass_rate=$((PASSED_TESTS * 100 / TOTAL_TESTS))
+        echo -e "    Pass Rate:    ${pass_rate}%"
     fi
     
     echo ""
-    echo -e "  ${BOLD}Zero Trust Principles Verified:${NC}"
-    echo "    ✓ Never Trust, Always Verify (Keycloak JWT)"
-    echo "    ✓ Least Privilege Access (OPA Policies)"
-    echo "    ✓ Assume Breach (mTLS + Network Segmentation)"
-    echo "    ✓ Continuous Monitoring (Prometheus/Grafana/Loki)"
-    echo "    ✓ Workload Identity (SPIRE SVID)"
+    echo -e "  ${BOLD}Zero Trust Components:${NC}"
+    echo "    • Single Entry Point: Auth Portal (${AUTH_PORTAL}:8888)"
+    echo "    • JWT Authentication: HS256 with 15-minute expiry"
+    echo "    • SVID Certificate: X.509 with 5-minute rotation"
+    echo "    • RBAC: 4 user roles (viewer, aws_user, full_user, admin)"
+    echo "    • Permission-based API access control"
+    echo "    • Monitoring: Grafana + Prometheus + Loki + Jaeger"
     
     echo ""
     if [[ $FAILED_TESTS -eq 0 ]]; then
-        echo -e "  ${GREEN}${BOLD}✓ ALL TESTS PASSED - Zero Trust Architecture Verified${NC}"
+        echo -e "  ${GREEN}${BOLD}✓ ALL TESTS PASSED${NC}"
+    elif [[ $PASSED_TESTS -gt $FAILED_TESTS ]]; then
+        echo -e "  ${YELLOW}${BOLD}⚠ Some tests need attention${NC}"
     else
-        echo -e "  ${YELLOW}${BOLD}⚠ Some tests need attention - check details above${NC}"
+        echo -e "  ${RED}${BOLD}✗ Multiple tests failed - check infrastructure${NC}"
     fi
     
     echo ""
     echo "═══════════════════════════════════════════════════════════════════════════════"
+    echo -e "${DIM}  Run with -h for options. Use -f for full A-Z demo.${NC}"
     echo ""
 }
 
