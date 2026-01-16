@@ -1,0 +1,986 @@
+---
+- name: Install Base Packages
+  hosts: all
+  become: yes
+  tasks:
+    - apt: { name: [curl, jq, python3-pip, python3-docker, openssl, wireguard, iptables-persistent], state: present, update_cache: yes }
+
+- name: Configure Keycloak
+  hosts: vm-identity
+  become: yes
+  tasks:
+    - shell: curl -fsSL https://get.docker.com | sh
+      args: { creates: /usr/bin/docker }
+    
+    - docker_container:
+        name: keycloak
+        image: "quay.io/keycloak/keycloak:23.0.4"
+        state: started
+        restart_policy: always
+        ports: ["8080:8080"]
+        env: 
+          KEYCLOAK_ADMIN: admin
+          KEYCLOAK_ADMIN_PASSWORD: Admin@123
+          KC_HTTP_PORT: "8080"
+        command: start-dev
+    
+    - wait_for: { host: localhost, port: 8080, delay: 10, timeout: 120 }
+    
+    - shell: docker logs keycloak 2>&1 | grep -q "Listening on"
+      register: keycloak_ready
+      until: keycloak_ready is succeeded
+      retries: 30
+      delay: 5
+    
+    - pause: { seconds: 10 }
+    - shell: |
+        KC="/opt/keycloak/bin/kcadm.sh"
+        AUTH="--server http://localhost:8080 --realm master --user admin --password Admin@123"
+        docker exec keycloak $KC config credentials $AUTH
+        
+        docker exec keycloak $KC create realms -s realm=zta -s enabled=true \
+          -s accessTokenLifespan=900 \
+          -s accessTokenLifespanForImplicitFlow=900 \
+          -s ssoSessionIdleTimeout=900 \
+          -s ssoSessionMaxLifespan=3600 || true
+        
+        docker exec keycloak $KC create users -r zta -s username=demo -s enabled=true || true
+        docker exec keycloak $KC set-password -r zta --username demo --new-password demo123
+        
+        CID=$(docker exec keycloak $KC get clients -r zta -q clientId=zta-web --fields id --format csv --noquotes 2>/dev/null || echo "")
+        [ ! -z "$CID" ] && docker exec keycloak $KC delete clients/$CID -r zta
+        docker exec keycloak $KC create clients -r zta \
+          -s clientId=zta-web \
+          -s enabled=true \
+          -s publicClient=true \
+          -s directAccessGrantsEnabled=true \
+          -s standardFlowEnabled=true \
+          -s 'redirectUris=["http://172.10.10.169/*","http://172.10.10.181/*"]' \
+          -s 'webOrigins=["*"]'
+
+# ============================================================
+# SPIRE Server with Full Zero Trust Configuration
+# ============================================================
+- name: Deploy SPIRE Server
+  hosts: vm-monitoring
+  become: yes
+  tasks:
+    - get_url: { url: "https://github.com/spiffe/spire/releases/download/v1.8.7/spire-1.8.7-linux-amd64-musl.tar.gz", dest: /tmp/spire.tar.gz }
+    - unarchive: { src: /tmp/spire.tar.gz, dest: /opt/, remote_src: yes, creates: /opt/spire-1.8.7 }
+    - file: { path: "/opt/spire/{{ item }}", state: directory, mode: '0755' }
+      loop: [conf, data, run]
+    
+    - copy:
+        dest: /opt/spire/conf/server.conf
+        content: |
+          server {
+            bind_address = "0.0.0.0"
+            bind_port = "8081"
+            trust_domain = "zta.local"
+            data_dir = "/opt/spire/data"
+            log_level = "DEBUG"
+            log_file = "/var/log/spire-server.log"
+            default_x509_svid_ttl = "5m"
+            default_jwt_svid_ttl = "5m"
+            ca_ttl = "24h"
+          }
+          
+          plugins {
+            DataStore "sql" {
+              plugin_data {
+                database_type = "sqlite3"
+                connection_string = "/opt/spire/data/datastore.sqlite3"
+              }
+            }
+            KeyManager "disk" {
+              plugin_data {
+                keys_path = "/opt/spire/data/keys.json"
+              }
+            }
+            NodeAttestor "join_token" {
+              plugin_data {}
+            }
+          }
+          
+          health_checks {
+            listener_enabled = true
+            bind_address = "0.0.0.0"
+            bind_port = "8082"
+            live_path = "/live"
+            ready_path = "/ready"
+          }
+    
+    - copy:
+        dest: /etc/systemd/system/spire-server.service
+        content: |
+          [Unit]
+          Description=SPIRE Server - Workload Identity Provider
+          After=network.target
+          
+          [Service]
+          Type=simple
+          ExecStart=/opt/spire-1.8.7/bin/spire-server run -config /opt/spire/conf/server.conf
+          Restart=always
+          RestartSec=5
+          
+          [Install]
+          WantedBy=multi-user.target
+    
+    - systemd:
+        name: spire-server
+        enabled: yes
+        state: started
+        daemon_reload: yes
+    
+    - wait_for: { host: localhost, port: 8081, delay: 10, timeout: 120 }
+    
+    - name: Generate join tokens
+      shell: |
+        /opt/spire-1.8.7/bin/spire-server token generate -spiffeID spiffe://zta.local/agent/aws-gateway 2>/dev/null | grep -oP 'Token: \K.*' > /opt/spire/aws-token.txt || echo "PENDING" > /opt/spire/aws-token.txt
+        /opt/spire-1.8.7/bin/spire-server token generate -spiffeID spiffe://zta.local/agent/os-gateway 2>/dev/null | grep -oP 'Token: \K.*' > /opt/spire/os-token.txt || echo "PENDING" > /opt/spire/os-token.txt
+      ignore_errors: yes
+    
+    - name: Register SPIRE entries
+      shell: |
+        /opt/spire-1.8.7/bin/spire-server entry create \
+          -parentID spiffe://zta.local/agent/aws-gateway \
+          -spiffeID spiffe://zta.local/workload/aws-envoy \
+          -selector unix:uid:0 -ttl 300 2>/dev/null || true
+        /opt/spire-1.8.7/bin/spire-server entry create \
+          -parentID spiffe://zta.local/agent/os-gateway \
+          -spiffeID spiffe://zta.local/workload/os-envoy \
+          -selector unix:uid:0 -ttl 300 2>/dev/null || true
+        /opt/spire-1.8.7/bin/spire-server entry create \
+          -parentID spiffe://zta.local/agent/os-gateway \
+          -spiffeID spiffe://zta.local/workload/backend-api \
+          -selector unix:uid:0 -ttl 300 2>/dev/null || true
+      ignore_errors: yes
+
+# ============================================================
+# SPIRE Agent on AWS Gateway
+# ============================================================
+- name: Deploy SPIRE Agent (AWS Gateway)
+  hosts: vm-aws-gateway
+  become: yes
+  tasks:
+    - get_url: { url: "https://github.com/spiffe/spire/releases/download/v1.8.7/spire-1.8.7-linux-amd64-musl.tar.gz", dest: /tmp/spire.tar.gz }
+    - unarchive: { src: /tmp/spire.tar.gz, dest: /opt/, remote_src: yes, creates: /opt/spire-1.8.7 }
+    - file: { path: "/opt/spire/{{ item }}", state: directory, mode: '0755' }
+      loop: [conf, data, run]
+    
+    - slurp: { src: /opt/spire/aws-token.txt }
+      register: aws_token
+      delegate_to: vm-monitoring
+      ignore_errors: yes
+    
+    - copy:
+        dest: /opt/spire/conf/agent.conf
+        content: |
+          agent {
+            data_dir = "/opt/spire/data"
+            log_level = "DEBUG"
+            log_file = "/var/log/spire-agent.log"
+            server_address = "{{ monitoring_public_ip }}"
+            server_port = "8081"
+            socket_path = "/opt/spire/run/agent.sock"
+            trust_domain = "zta.local"
+          }
+          
+          plugins {
+            NodeAttestor "join_token" {
+              plugin_data {}
+            }
+            KeyManager "disk" {
+              plugin_data { directory = "/opt/spire/data" }
+            }
+            WorkloadAttestor "unix" {
+              plugin_data {}
+            }
+          }
+    
+    - copy:
+        dest: /etc/systemd/system/spire-agent.service
+        content: |
+          [Unit]
+          Description=SPIRE Agent
+          After=network.target
+          
+          [Service]
+          Type=simple
+          ExecStart=/opt/spire-1.8.7/bin/spire-agent run -config /opt/spire/conf/agent.conf
+          Restart=always
+          RestartSec=5
+          
+          [Install]
+          WantedBy=multi-user.target
+
+# ============================================================
+# SPIRE Agent on OS Gateway
+# ============================================================
+- name: Deploy SPIRE Agent (OS Gateway)
+  hosts: vm-os-gateway
+  become: yes
+  tasks:
+    - get_url: { url: "https://github.com/spiffe/spire/releases/download/v1.8.7/spire-1.8.7-linux-amd64-musl.tar.gz", dest: /tmp/spire.tar.gz }
+    - unarchive: { src: /tmp/spire.tar.gz, dest: /opt/, remote_src: yes, creates: /opt/spire-1.8.7 }
+    - file: { path: "/opt/spire/{{ item }}", state: directory, mode: '0755' }
+      loop: [conf, data, run]
+    
+    - copy:
+        dest: /opt/spire/conf/agent.conf
+        content: |
+          agent {
+            data_dir = "/opt/spire/data"
+            log_level = "DEBUG"
+            log_file = "/var/log/spire-agent.log"
+            server_address = "{{ monitoring_public_ip }}"
+            server_port = "8081"
+            socket_path = "/opt/spire/run/agent.sock"
+            trust_domain = "zta.local"
+          }
+          
+          plugins {
+            NodeAttestor "join_token" {
+              plugin_data {}
+            }
+            KeyManager "disk" {
+              plugin_data { directory = "/opt/spire/data" }
+            }
+            WorkloadAttestor "unix" {
+              plugin_data {}
+            }
+          }
+    
+    - copy:
+        dest: /etc/systemd/system/spire-agent.service
+        content: |
+          [Unit]
+          Description=SPIRE Agent
+          After=network.target
+          
+          [Service]
+          Type=simple
+          ExecStart=/opt/spire-1.8.7/bin/spire-agent run -config /opt/spire/conf/agent.conf
+          Restart=always
+          RestartSec=5
+          
+          [Install]
+          WantedBy=multi-user.target
+
+# ============================================================
+# Monitoring Stack
+# ============================================================
+- name: Deploy Monitoring Stack
+  hosts: vm-monitoring
+  become: yes
+  tasks:
+    - shell: curl -fsSL https://get.docker.com | sh
+      args: { creates: /usr/bin/docker }
+    
+    - file: { path: "{{ item }}", state: directory, mode: '0777' }
+      loop: [/opt/prometheus, /opt/loki, /opt/loki/data, /opt/grafana, /opt/promtail]
+    
+    - copy:
+        dest: /opt/prometheus/prometheus.yml
+        content: |
+          global:
+            scrape_interval: 15s
+          scrape_configs:
+            - job_name: 'envoy-aws'
+              static_configs:
+                - targets: ['172.10.10.169:9901']
+            - job_name: 'envoy-os'
+              static_configs:
+                - targets: ['172.10.10.181:9901']
+            - job_name: 'opa'
+              static_configs:
+                - targets: ['172.10.10.169:8181']
+    
+    - copy:
+        dest: /opt/loki/loki-config.yml
+        content: |
+          auth_enabled: false
+          server:
+            http_listen_port: 3100
+          ingester:
+            lifecycler:
+              address: 127.0.0.1
+              ring:
+                kvstore:
+                  store: inmemory
+                replication_factor: 1
+            chunk_idle_period: 5m
+            chunk_retain_period: 30s
+          schema_config:
+            configs:
+              - from: 2020-05-15
+                store: tsdb
+                object_store: filesystem
+                schema: v13
+                index:
+                  prefix: index_
+                  period: 24h
+          storage_config:
+            tsdb_shipper:
+              active_index_directory: /loki/index
+              cache_location: /loki/cache
+            filesystem:
+              directory: /loki/chunks
+          limits_config:
+            allow_structured_metadata: true
+            reject_old_samples: true
+            reject_old_samples_max_age: 168h
+          compactor:
+            working_directory: /loki/compactor
+    
+    - docker_container:
+        name: prometheus
+        image: prom/prometheus:latest
+        state: started
+        restart_policy: always
+        ports: ["9090:9090"]
+        volumes: ["/opt/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    
+    - docker_container:
+        name: loki
+        image: grafana/loki:latest
+        state: started
+        restart_policy: always
+        user: root
+        ports: ["3100:3100"]
+        volumes:
+          - "/opt/loki/loki-config.yml:/etc/loki/loki-config.yml:ro"
+          - "/opt/loki/data:/loki"
+        command: ["-config.file=/etc/loki/loki-config.yml"]
+    
+    - docker_container:
+        name: jaeger
+        image: jaegertracing/all-in-one:latest
+        state: started
+        restart_policy: always
+        ports: ["16686:16686", "6831:6831/udp"]
+    
+    - docker_container:
+        name: grafana
+        image: grafana/grafana:latest
+        state: started
+        restart_policy: always
+        ports: ["3000:3000"]
+        volumes: ["/opt/grafana:/var/lib/grafana"]
+        env:
+          GF_SECURITY_ADMIN_PASSWORD: "admin"
+    
+    - wait_for: { host: localhost, port: 9090, delay: 5, timeout: 60 }
+    - wait_for: { host: localhost, port: 3100, delay: 5, timeout: 60 }
+    - wait_for: { host: localhost, port: 3000, delay: 5, timeout: 60 }
+
+    - apt: { name: socat, state: present }
+    
+    - copy:
+        dest: /etc/systemd/system/keycloak-proxy.service
+        content: |
+          [Unit]
+          Description=Keycloak Proxy
+          After=network.target
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/socat TCP-LISTEN:8080,reuseaddr,fork TCP:10.30.1.20:8080
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+    
+    - systemd:
+        name: keycloak-proxy
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+# ============================================================
+# Keycloak Forward on AWS Gateway
+# ============================================================
+- name: Setup Keycloak Forward (AWS Gateway)
+  hosts: vm-aws-gateway
+  become: yes
+  tasks:
+    - apt: { name: socat, state: present }
+    
+    - copy:
+        dest: /etc/systemd/system/keycloak-forward.service
+        content: |
+          [Unit]
+          Description=Keycloak Forward
+          After=network.target
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/socat TCP-LISTEN:8888,reuseaddr,fork TCP:{{ monitoring_public_ip }}:8080
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+    
+    - systemd:
+        name: keycloak-forward
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+# ============================================================
+# WireGuard Tunnel
+# ============================================================
+- name: Setup WireGuard (AWS Gateway)
+  hosts: vm-aws-gateway
+  become: yes
+  tasks:
+    - shell: |
+        [ ! -f /etc/wireguard/privatekey ] && wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey
+        chmod 600 /etc/wireguard/privatekey
+      args: { creates: /etc/wireguard/privatekey }
+    
+    - shell: |
+        cat > /etc/wireguard/wg0.conf << 'EOF'
+        [Interface]
+        Address = 10.99.0.1/24
+        ListenPort = 51820
+        PrivateKey = PLACEHOLDER_AWS_PRIVKEY
+        PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+        PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+        [Peer]
+        PublicKey = PLACEHOLDER_OS_PUBKEY
+        AllowedIPs = 10.99.0.2/32, 10.10.2.0/24
+        Endpoint = PLACEHOLDER_OS_IP:51820
+        PersistentKeepalive = 25
+        EOF
+        chmod 600 /etc/wireguard/wg0.conf
+    
+    - shell: sed -i "s|PLACEHOLDER_AWS_PRIVKEY|$(cat /etc/wireguard/privatekey)|g" /etc/wireguard/wg0.conf
+    - shell: sed -i "s|PLACEHOLDER_OS_IP|{{ os_gateway_public_ip }}|g" /etc/wireguard/wg0.conf
+    
+    - sysctl: { name: net.ipv4.ip_forward, value: '1', sysctl_set: yes, state: present, reload: yes }
+
+- name: Setup WireGuard (OS Gateway)
+  hosts: vm-os-gateway
+  become: yes
+  tasks:
+    - shell: |
+        [ ! -f /etc/wireguard/privatekey ] && wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey
+        chmod 600 /etc/wireguard/privatekey
+      args: { creates: /etc/wireguard/privatekey }
+    
+    - shell: |
+        cat > /etc/wireguard/wg0.conf << 'EOF'
+        [Interface]
+        Address = 10.99.0.2/24
+        ListenPort = 51820
+        PrivateKey = PLACEHOLDER_OS_PRIVKEY
+        PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+        PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+        [Peer]
+        PublicKey = PLACEHOLDER_AWS_PUBKEY
+        AllowedIPs = 10.99.0.1/32, 10.20.2.0/24
+        Endpoint = PLACEHOLDER_AWS_IP:51820
+        PersistentKeepalive = 25
+        EOF
+        chmod 600 /etc/wireguard/wg0.conf
+    
+    - shell: sed -i "s|PLACEHOLDER_OS_PRIVKEY|$(cat /etc/wireguard/privatekey)|g" /etc/wireguard/wg0.conf
+    - shell: sed -i "s|PLACEHOLDER_AWS_IP|{{ aws_gateway_public_ip }}|g" /etc/wireguard/wg0.conf
+    
+    - sysctl: { name: net.ipv4.ip_forward, value: '1', sysctl_set: yes, state: present, reload: yes }
+
+- name: Exchange WireGuard Keys
+  hosts: vm-aws-gateway
+  become: yes
+  tasks:
+    - slurp: { src: /etc/wireguard/publickey }
+      register: aws_pubkey
+    
+    - slurp: { src: /etc/wireguard/publickey }
+      register: os_pubkey
+      delegate_to: vm-os-gateway
+    
+    - shell: sed -i "s|PLACEHOLDER_OS_PUBKEY|$(echo '{{ os_pubkey.content }}' | base64 -d | tr -d '\n')|g" /etc/wireguard/wg0.conf
+    
+    - shell: sed -i "s|PLACEHOLDER_AWS_PUBKEY|$(echo '{{ aws_pubkey.content }}' | base64 -d | tr -d '\n')|g" /etc/wireguard/wg0.conf
+      delegate_to: vm-os-gateway
+    
+    - systemd: { name: wg-quick@wg0, enabled: yes, state: restarted }
+    - systemd: { name: wg-quick@wg0, enabled: yes, state: restarted }
+      delegate_to: vm-os-gateway
+
+# ============================================================
+# AWS Gateway with OPA
+# ============================================================
+- name: Configure AWS Gateway
+  hosts: vm-aws-gateway
+  become: yes
+  tasks:
+    - shell: curl -fsSL https://get.docker.com | sh
+      args: { creates: /usr/bin/docker }
+    - file: { path: /opt/certs, state: directory, mode: '0755' }
+    - file: { path: /opt/opa, state: directory, mode: '0755' }
+    
+    - shell: |
+        cd /opt/certs
+        [ ! -f ca-key.pem ] && openssl genrsa -out ca-key.pem 4096 && openssl req -new -x509 -days 3650 -key ca-key.pem -out ca-cert.pem -subj "/C=VN/CN=ZTA-CA"
+        [ ! -f aws-client-key.pem ] && openssl genrsa -out aws-client-key.pem 4096 && openssl req -new -key aws-client-key.pem -out aws-client.csr -subj "/C=VN/CN=aws-client" && openssl x509 -req -days 3650 -in aws-client.csr -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial -out aws-client-cert.pem
+        chmod 644 *.pem
+
+    - copy:
+        dest: /opt/opa/policy.rego
+        content: |
+          package envoy.authz
+          
+          import future.keywords.if
+          import future.keywords.in
+          import input.attributes.request.http as http_request
+          
+          default allow = false
+          
+          allow if {
+            http_request.method == "GET"
+            http_request.path == "/"
+          }
+          
+          allow if {
+            http_request.method == "GET"
+            startswith(http_request.path, "/static/")
+          }
+          
+          allow if {
+            http_request.path in ["/health", "/ready", "/live"]
+          }
+          
+          allow if {
+            startswith(http_request.path, "/auth/")
+          }
+          
+          allow if {
+            startswith(http_request.path, "/realms/")
+          }
+          
+          allow if {
+            startswith(http_request.path, "/api/")
+            is_valid_token
+          }
+          
+          is_valid_token if {
+            auth_header := http_request.headers.authorization
+            startswith(auth_header, "Bearer ")
+            token := substring(auth_header, 7, -1)
+            token != ""
+            count(token) > 20
+          }
+    
+    - copy:
+        dest: /opt/opa/spiffe_policy.rego
+        content: |
+          package spiffe.authz
+          
+          import future.keywords.if
+          import future.keywords.in
+          
+          default allow_service = false
+          
+          trust_domain := "zta.local"
+          
+          allowed_communications := {
+            "spiffe://zta.local/workload/aws-envoy": ["spiffe://zta.local/workload/os-envoy"],
+            "spiffe://zta.local/workload/os-envoy": ["spiffe://zta.local/workload/backend-api"],
+          }
+          
+          allow_service if {
+            source_spiffe := input.source.principal
+            dest_spiffe := input.destination.principal
+            allowed_destinations := allowed_communications[source_spiffe]
+            dest_spiffe in allowed_destinations
+          }
+
+    - docker_container:
+        name: opa
+        image: openpolicyagent/opa:latest-envoy
+        state: started
+        restart_policy: always
+        ports: ["9191:9191", "8181:8181"]
+        volumes: ["/opt/opa:/policies:ro"]
+        command: ["run", "--server", "--addr=0.0.0.0:8181", "--set=plugins.envoy_ext_authz_grpc.addr=:9191", "--set=decision_logs.console=true", "/policies/"]
+    
+    - wait_for: { host: localhost, port: 8181, delay: 5, timeout: 60 }
+
+    - copy:
+        dest: /opt/envoy-aws.yaml
+        content: |
+          static_resources:
+            listeners:
+            - name: listener_0
+              address: { socket_address: { address: 0.0.0.0, port_value: 8080 } }
+              filter_chains:
+              - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: ingress_http
+                    access_log:
+                    - name: envoy.access_loggers.file
+                      typed_config:
+                        "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                        path: /dev/stdout
+                    route_config:
+                      name: local_route
+                      virtual_hosts:
+                      - name: backend
+                        domains: ["*"]
+                        routes:
+                        - match: { prefix: "/api/" }
+                          route:
+                            cluster: os_gateway_backend
+                            timeout: 30s
+                        - match: { prefix: "/auth/token" }
+                          route:
+                            cluster: keycloak_cluster
+                            prefix_rewrite: /realms/zta/protocol/openid-connect/token
+                        - match: { prefix: "/realms/" }
+                          route: { cluster: keycloak_cluster }
+                        - match: { prefix: "/" }
+                          route: { cluster: local_frontend }
+                    http_filters:
+                    - name: envoy.filters.http.jwt_authn
+                      typed_config:
+                        "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+                        providers:
+                          keycloak_provider:
+                            issuer: http://{{ aws_gateway_public_ip }}/realms/zta
+                            remote_jwks:
+                              http_uri:
+                                uri: http://172.17.0.1:8888/realms/zta/protocol/openid-connect/certs
+                                cluster: keycloak_cluster
+                                timeout: 5s
+                              cache_duration: { seconds: 300 }
+                        rules:
+                        - match: { prefix: "/api/" }
+                          requires: { provider_name: keycloak_provider }
+                    - name: envoy.filters.http.router
+                      typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router }
+            clusters:
+            - name: local_frontend
+              connect_timeout: 5s
+              type: STRICT_DNS
+              load_assignment:
+                cluster_name: local_frontend
+                endpoints:
+                - lb_endpoints:
+                  - endpoint:
+                      address: { socket_address: { address: 10.20.2.10, port_value: 30090 } }
+            - name: os_gateway_backend
+              connect_timeout: 10s
+              type: STRICT_DNS
+              transport_socket:
+                name: envoy.transport_sockets.tls
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+                  common_tls_context:
+                    tls_certificates:
+                    - certificate_chain: { filename: /etc/envoy/certs/aws-client-cert.pem }
+                      private_key: { filename: /etc/envoy/certs/aws-client-key.pem }
+                    validation_context:
+                      trusted_ca: { filename: /etc/envoy/certs/ca-cert.pem }
+              load_assignment:
+                cluster_name: os_gateway_backend
+                endpoints:
+                - lb_endpoints:
+                  - endpoint:
+                      address: { socket_address: { address: 10.99.0.2, port_value: 443 } }
+            - name: keycloak_cluster
+              connect_timeout: 5s
+              type: STRICT_DNS
+              load_assignment:
+                cluster_name: keycloak_cluster
+                endpoints:
+                - lb_endpoints:
+                  - endpoint:
+                      address: { socket_address: { address: 172.17.0.1, port_value: 8888 } }
+
+    - shell: |
+        iptables -t nat -C PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8080 2>/dev/null || \
+        iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8080
+        netfilter-persistent save 2>/dev/null || true
+    
+    - docker_container:
+        name: envoy-aws
+        image: envoyproxy/envoy:v1.28-latest
+        state: started
+        restart_policy: always
+        user: "0:0"
+        network_mode: host
+        volumes:
+          - /opt/envoy-aws.yaml:/etc/envoy/envoy.yaml:ro
+          - /opt/certs:/etc/envoy/certs:ro
+
+# ============================================================
+# OS Gateway
+# ============================================================
+- name: Configure OS Gateway
+  hosts: vm-os-gateway
+  become: yes
+  tasks:
+    - shell: curl -fsSL https://get.docker.com | sh
+      args: { creates: /usr/bin/docker }
+    - file: { path: /opt/certs, state: directory, mode: '0755' }
+    
+    - shell: |
+        cd /opt/certs
+        [ ! -f ca-cert.pem ] && openssl genrsa -out ca-key.pem 4096 && openssl req -new -x509 -days 3650 -key ca-key.pem -out ca-cert.pem -subj "/C=VN/CN=ZTA-CA"
+        [ ! -f os-server-key.pem ] && openssl genrsa -out os-server-key.pem 4096 && openssl req -new -key os-server-key.pem -out os-server.csr -subj "/C=VN/CN=os-server" && openssl x509 -req -days 3650 -in os-server.csr -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial -out os-server-cert.pem
+        chmod 644 *.pem
+    
+    - copy:
+        dest: /opt/envoy-os.yaml
+        content: |
+          static_resources:
+            listeners:
+            - name: listener_0
+              address: { socket_address: { address: 0.0.0.0, port_value: 443 } }
+              filter_chains:
+              - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: ingress_https
+                    access_log:
+                    - name: envoy.access_loggers.file
+                      typed_config:
+                        "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                        path: /dev/stdout
+                    route_config:
+                      name: local_route
+                      virtual_hosts:
+                      - name: backend_services
+                        domains: ["*"]
+                        routes:
+                        - match: { prefix: "/api/" }
+                          route:
+                            cluster: backend_k3s_cluster
+                            timeout: 30s
+                    http_filters:
+                    - name: envoy.filters.http.router
+                      typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router }
+                transport_socket:
+                  name: envoy.transport_sockets.tls
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+                    require_client_certificate: true
+                    common_tls_context:
+                      tls_certificates:
+                      - certificate_chain: { filename: /etc/envoy/certs/os-server-cert.pem }
+                        private_key: { filename: /etc/envoy/certs/os-server-key.pem }
+                      validation_context:
+                        trusted_ca: { filename: /etc/envoy/certs/ca-cert.pem }
+            clusters:
+            - name: backend_k3s_cluster
+              connect_timeout: 5s
+              type: STRICT_DNS
+              load_assignment:
+                cluster_name: backend_k3s_cluster
+                endpoints:
+                - lb_endpoints:
+                  - endpoint:
+                      address: { socket_address: { address: 10.10.2.10, port_value: 30091 } }
+    
+    - docker_container:
+        name: envoy-os
+        image: envoyproxy/envoy:v1.28-latest
+        state: started
+        restart_policy: always
+        user: "0:0"
+        ports: ["443:443", "9901:9901"]
+        volumes:
+          - /opt/envoy-os.yaml:/etc/envoy/envoy.yaml:ro
+          - /opt/certs:/etc/envoy/certs:ro
+
+# ============================================================
+# Frontend App (AWS)
+# ============================================================
+- name: Frontend App (AWS)
+  hosts: aws-master
+  become: yes
+  tasks:
+    - shell: curl -sfL https://get.k3s.io | sh -s - server --disable traefik --write-kubeconfig-mode 644
+      args: { creates: /etc/rancher/k3s/k3s.yaml }
+    - wait_for: { port: 6443, delay: 10, timeout: 300 }
+    
+    - shell: |
+        cat <<'EOF' | kubectl apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: { name: frontend-html }
+        data:
+          index.html: |
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+              <meta charset="UTF-8">
+              <title>Zero Trust Architecture Demo</title>
+              <style>
+                body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+                .container { background: #f5f5f5; padding: 30px; border-radius: 8px; }
+                button { background: #4CAF50; color: white; padding: 12px 24px; border: none; border-radius: 4px; cursor: pointer; margin: 5px; }
+                button:hover { background: #45a049; }
+                #result { margin-top: 20px; padding: 15px; background: white; border-radius: 4px; white-space: pre-wrap; }
+                .error { color: red; }
+                .success { color: green; }
+              </style>
+            </head>
+            <body>
+              <div class="container">
+                <h1>Zero Trust Architecture Demo</h1>
+                <p><strong>Flow:</strong> User - AWS Gateway (Envoy + OPA) - mTLS - OS Gateway - Backend</p>
+                <h3>Step 1: Authentication</h3>
+                <button onclick="login()">Login (Keycloak)</button>
+                <button onclick="logout()">Logout</button>
+                <h3>Step 2: Access Protected Data</h3>
+                <button onclick="fetchData()">Fetch Secure Data</button>
+                <div id="result"></div>
+              </div>
+              <script>
+                const resultDiv = document.getElementById('result');
+                async function login() {
+                  const username = prompt('Username:', 'demo');
+                  const password = prompt('Password:', 'demo123');
+                  resultDiv.innerHTML = 'Authenticating...';
+                  try {
+                    const res = await fetch('/auth/token', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                      body: 'username='+username+'&password='+password+'&grant_type=password&client_id=zta-web'
+                    });
+                    const data = await res.json();
+                    if (data.access_token) {
+                      localStorage.setItem('token', data.access_token);
+                      resultDiv.innerHTML = '<span class="success">Authentication successful! JWT stored.</span>';
+                    } else {
+                      resultDiv.innerHTML = '<span class="error">Authentication failed: ' + JSON.stringify(data) + '</span>';
+                    }
+                  } catch (err) {
+                    resultDiv.innerHTML = '<span class="error">Error: ' + err.message + '</span>';
+                  }
+                }
+                function logout() {
+                  localStorage.removeItem('token');
+                  resultDiv.innerHTML = '<span class="success">Logged out</span>';
+                }
+                async function fetchData() {
+                  const token = localStorage.getItem('token');
+                  if (!token) {
+                    resultDiv.innerHTML = '<span class="error">Please login first!</span>';
+                    return;
+                  }
+                  resultDiv.innerHTML = 'Fetching data...';
+                  try {
+                    const res = await fetch('/api/secure-data', {
+                      headers: { 'Authorization': 'Bearer ' + token }
+                    });
+                    if (res.ok) {
+                      const data = await res.json();
+                      resultDiv.innerHTML = '<span class="success">Data retrieved!</span><br><pre>' + JSON.stringify(data, null, 2) + '</pre>';
+                    } else {
+                      resultDiv.innerHTML = '<span class="error">Access denied: HTTP ' + res.status + '</span>';
+                    }
+                  } catch (err) {
+                    resultDiv.innerHTML = '<span class="error">Error: ' + err.message + '</span>';
+                  }
+                }
+              </script>
+            </body>
+            </html>
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: { name: frontend }
+        spec:
+          replicas: 1
+          selector: { matchLabels: { app: frontend } }
+          template:
+            metadata: { labels: { app: frontend } }
+            spec:
+              containers:
+              - name: nginx
+                image: nginx:alpine
+                ports: [{ containerPort: 80 }]
+                volumeMounts: [{ name: html, mountPath: /usr/share/nginx/html }]
+              volumes: [{ name: html, configMap: { name: frontend-html } }]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: { name: frontend-svc }
+        spec:
+          type: NodePort
+          selector: { app: frontend }
+          ports: [{ port: 80, targetPort: 80, nodePort: 30090 }]
+        EOF
+
+# ============================================================
+# Backend App (OS)
+# ============================================================
+- name: Backend App (OS)
+  hosts: os-master
+  become: yes
+  tasks:
+    - shell: curl -sfL https://get.k3s.io | sh -s - server --disable traefik --write-kubeconfig-mode 644
+      args: { creates: /etc/rancher/k3s/k3s.yaml }
+    - wait_for: { port: 6443, delay: 10, timeout: 300 }
+    
+    - shell: |
+        cat <<'EOF' | kubectl apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: { name: backend-app }
+        data:
+          app.py: |
+            from flask import Flask, jsonify
+            import socket
+            app = Flask(__name__)
+            @app.route('/api/secure-data')
+            def secure_data():
+                return jsonify({
+                    "status": "success",
+                    "message": "Zero Trust validation passed!",
+                    "data": {
+                        "sensitive_info": "Data from Private Cloud",
+                        "server": socket.gethostname(),
+                        "security_layers": [
+                            "1. Keycloak JWT",
+                            "2. Envoy JWT Validation",
+                            "3. OPA Policy",
+                            "4. mTLS",
+                            "5. OS Gateway Certificate"
+                        ]
+                    }
+                })
+            if __name__ == '__main__':
+                app.run(host='0.0.0.0', port=80)
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: { name: backend }
+        spec:
+          replicas: 1
+          selector: { matchLabels: { app: backend } }
+          template:
+            metadata: { labels: { app: backend } }
+            spec:
+              containers:
+              - name: backend
+                image: python:3.9-slim
+                command: ["/bin/bash", "-c", "pip install flask && python /app/app.py"]
+                ports: [{ containerPort: 80 }]
+                volumeMounts: [{ name: app, mountPath: /app }]
+              volumes: [{ name: app, configMap: { name: backend-app } }]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: { name: backend-svc }
+        spec:
+          type: NodePort
+          selector: { app: backend }
+          ports: [{ port: 80, targetPort: 80, nodePort: 30091 }]
+        EOF
