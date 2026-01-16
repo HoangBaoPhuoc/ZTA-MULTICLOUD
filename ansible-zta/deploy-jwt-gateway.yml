@@ -1,0 +1,1134 @@
+---
+# Deploy JWT-based Gateway - No Docker needed (runs natively with Python3)
+# Phù hợp với Hub-and-Spoke Zero Trust (internal networks không có internet)
+
+- name: Deploy Auth Portal with JWT Generation
+  hosts: vm-auth-portal
+  become: yes
+  tasks:
+    - name: Create auth directory
+      file:
+        path: /opt/auth-portal
+        state: directory
+        mode: '0755'
+
+    - name: Create JWT Authentication Script
+      copy:
+        dest: /opt/auth-portal/auth.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          """
+          JWT Authentication Server for ZTA
+          - Generates JWT tokens with role and permissions
+          - Gateway validates JWT for authorization
+          """
+          import json
+          import base64
+          import hmac
+          import hashlib
+          import time
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          from urllib.parse import parse_qs, urlparse
+          
+          # Secret key for JWT signing (in production, use environment variable)
+          JWT_SECRET = "zta-hub-spoke-secret-key-2024"
+          
+          # User database with roles and permissions
+          USERS = {
+              "aws_user": {
+                  "password": "aws123",
+                  "role": "aws_viewer",
+                  "permissions": ["aws:read"],
+                  "display_name": "AWS User"
+              },
+              "full_user": {
+                  "password": "full123",
+                  "role": "admin",
+                  "permissions": ["aws:read", "os:fetch"],
+                  "display_name": "Full Access User"
+              },
+              "monitor": {
+                  "password": "monitor123",
+                  "role": "monitor",
+                  "permissions": ["monitor:read"],
+                  "display_name": "Monitoring User"
+              }
+          }
+          
+          def base64url_encode(data):
+              if isinstance(data, str):
+                  data = data.encode('utf-8')
+              return base64.urlsafe_b64encode(data).rstrip(b'=').decode('utf-8')
+          
+          def create_jwt(payload, secret):
+              header = {"alg": "HS256", "typ": "JWT"}
+              header_b64 = base64url_encode(json.dumps(header))
+              payload_b64 = base64url_encode(json.dumps(payload))
+              message = f"{header_b64}.{payload_b64}"
+              signature = hmac.new(secret.encode(), message.encode(), hashlib.sha256).digest()
+              signature_b64 = base64url_encode(signature)
+              return f"{message}.{signature_b64}"
+          
+          class AuthHandler(BaseHTTPRequestHandler):
+              def do_OPTIONS(self):
+                  self.send_response(200)
+                  self.send_header('Access-Control-Allow-Origin', '*')
+                  self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+                  self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+                  self.end_headers()
+              
+              def do_GET(self):
+                  if self.path == '/health':
+                      self.send_response(200)
+                      self.send_header('Content-Type', 'application/json')
+                      self.end_headers()
+                      self.wfile.write(json.dumps({"status": "healthy"}).encode())
+                      return
+                  
+                  self.send_response(404)
+                  self.end_headers()
+              
+              def do_POST(self):
+                  if self.path == '/api/login':
+                      content_length = int(self.headers.get('Content-Length', 0))
+                      body = self.rfile.read(content_length).decode('utf-8')
+                      
+                      try:
+                          data = json.loads(body)
+                          username = data.get('username', '')
+                          password = data.get('password', '')
+                          
+                          if username in USERS and USERS[username]['password'] == password:
+                              user = USERS[username]
+                              now = int(time.time())
+                              
+                              payload = {
+                                  "sub": username,
+                                  "name": user['display_name'],
+                                  "role": user['role'],
+                                  "permissions": user['permissions'],
+                                  "iat": now,
+                                  "exp": now + 900,  # 15 minutes
+                                  "iss": "zta-auth-portal",
+                                  "aud": "zta-services"
+                              }
+                              
+                              token = create_jwt(payload, JWT_SECRET)
+                              
+                              self.send_response(200)
+                              self.send_header('Content-Type', 'application/json')
+                              self.send_header('Access-Control-Allow-Origin', '*')
+                              self.end_headers()
+                              
+                              response = {
+                                  "success": True,
+                                  "token": token,
+                                  "user": {
+                                      "username": username,
+                                      "name": user['display_name'],
+                                      "role": user['role'],
+                                      "permissions": user['permissions']
+                                  }
+                              }
+                              self.wfile.write(json.dumps(response).encode())
+                          else:
+                              self.send_response(401)
+                              self.send_header('Content-Type', 'application/json')
+                              self.send_header('Access-Control-Allow-Origin', '*')
+                              self.end_headers()
+                              self.wfile.write(json.dumps({"success": False, "error": "Invalid credentials"}).encode())
+                      
+                      except Exception as e:
+                          self.send_response(500)
+                          self.send_header('Content-Type', 'application/json')
+                          self.end_headers()
+                          self.wfile.write(json.dumps({"error": str(e)}).encode())
+                      return
+                  
+                  self.send_response(404)
+                  self.end_headers()
+              
+              def log_message(self, format, *args):
+                  print(f"[AUTH] {args[0]}")
+          
+          if __name__ == '__main__':
+              server = HTTPServer(('0.0.0.0', 8888), AuthHandler)
+              print("Auth Server running on port 8888")
+              server.serve_forever()
+
+    - name: Create systemd service for Auth Server
+      copy:
+        dest: /etc/systemd/system/auth-server.service
+        content: |
+          [Unit]
+          Description=ZTA Auth Server with JWT
+          After=network.target
+          
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/python3 /opt/auth-portal/auth.py
+          Restart=always
+          RestartSec=5
+          
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start Auth Server
+      systemd:
+        name: auth-server
+        state: restarted
+        daemon_reload: yes
+        enabled: yes
+
+    - name: Update nginx config for Auth Portal
+      copy:
+        dest: /etc/nginx/sites-available/auth-portal
+        content: |
+          server {
+              listen 80;
+              server_name _;
+              
+              # Auth API - local auth server
+              location /api/login {
+                  proxy_pass http://127.0.0.1:8888;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+              
+              # AWS Cluster UI and API
+              location /aws/ {
+                  proxy_pass http://10.20.2.5:80/;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              }
+              
+              # OS Cluster API (proxied through AWS Gateway for authorization)
+              location /os/ {
+                  proxy_pass http://10.20.2.5:8080/os/;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header Authorization $http_authorization;
+              }
+              
+              # Monitoring
+              location /monitoring/ {
+                  proxy_pass http://10.50.1.20:3000/;
+                  proxy_set_header Host $host;
+              }
+              
+              # Main portal UI
+              location / {
+                  root /var/www/auth-portal;
+                  index index.html;
+                  try_files $uri $uri/ /index.html;
+              }
+          }
+
+    - name: Create Auth Portal UI
+      copy:
+        dest: /var/www/auth-portal/index.html
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>ZTA Hub-and-Spoke - Authentication Portal</title>
+              <style>
+                  * { margin: 0; padding: 0; box-sizing: border-box; }
+                  body { 
+                      font-family: 'Segoe UI', sans-serif; 
+                      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                      min-height: 100vh;
+                      display: flex;
+                      justify-content: center;
+                      align-items: center;
+                  }
+                  .container { 
+                      background: rgba(255,255,255,0.05);
+                      backdrop-filter: blur(10px);
+                      padding: 40px;
+                      border-radius: 20px;
+                      border: 1px solid rgba(255,255,255,0.1);
+                      width: 400px;
+                  }
+                  h1 { 
+                      color: #4fc3f7;
+                      text-align: center;
+                      margin-bottom: 10px;
+                  }
+                  .subtitle {
+                      color: #888;
+                      text-align: center;
+                      margin-bottom: 30px;
+                      font-size: 14px;
+                  }
+                  .form-group { margin-bottom: 20px; }
+                  label { 
+                      color: #ccc;
+                      display: block;
+                      margin-bottom: 8px;
+                  }
+                  input {
+                      width: 100%;
+                      padding: 12px;
+                      border: 1px solid rgba(255,255,255,0.2);
+                      border-radius: 8px;
+                      background: rgba(255,255,255,0.1);
+                      color: white;
+                      font-size: 16px;
+                  }
+                  input:focus { outline: none; border-color: #4fc3f7; }
+                  button {
+                      width: 100%;
+                      padding: 14px;
+                      background: linear-gradient(135deg, #4fc3f7, #2196f3);
+                      border: none;
+                      border-radius: 8px;
+                      color: white;
+                      font-size: 16px;
+                      cursor: pointer;
+                      transition: transform 0.2s;
+                  }
+                  button:hover { transform: translateY(-2px); }
+                  .error {
+                      background: rgba(244,67,54,0.2);
+                      color: #f44336;
+                      padding: 10px;
+                      border-radius: 8px;
+                      margin-bottom: 20px;
+                      display: none;
+                  }
+                  .success {
+                      background: rgba(76,175,80,0.2);
+                      color: #4caf50;
+                      padding: 10px;
+                      border-radius: 8px;
+                      margin-bottom: 20px;
+                      display: none;
+                  }
+                  .user-info {
+                      color: #ccc;
+                      text-align: center;
+                      margin-top: 20px;
+                      padding: 15px;
+                      background: rgba(255,255,255,0.05);
+                      border-radius: 10px;
+                      display: none;
+                  }
+                  .user-info h3 { color: #4fc3f7; margin-bottom: 10px; }
+                  .permissions { 
+                      display: flex; 
+                      flex-wrap: wrap; 
+                      gap: 8px; 
+                      justify-content: center;
+                      margin: 15px 0;
+                  }
+                  .permission-badge {
+                      background: rgba(79,195,247,0.2);
+                      color: #4fc3f7;
+                      padding: 5px 12px;
+                      border-radius: 20px;
+                      font-size: 12px;
+                  }
+                  .nav-links {
+                      display: flex;
+                      flex-direction: column;
+                      gap: 10px;
+                      margin-top: 15px;
+                  }
+                  .nav-link {
+                      display: block;
+                      padding: 12px;
+                      background: rgba(255,255,255,0.1);
+                      border-radius: 8px;
+                      color: #4fc3f7;
+                      text-decoration: none;
+                      text-align: center;
+                      transition: background 0.2s;
+                  }
+                  .nav-link:hover { background: rgba(255,255,255,0.2); }
+                  .nav-link.disabled {
+                      opacity: 0.3;
+                      pointer-events: none;
+                  }
+                  .logout-btn {
+                      margin-top: 15px;
+                      background: rgba(244,67,54,0.3);
+                  }
+                  .accounts-info {
+                      margin-top: 30px;
+                      padding: 15px;
+                      background: rgba(255,255,255,0.05);
+                      border-radius: 10px;
+                  }
+                  .accounts-info h4 { color: #888; margin-bottom: 10px; }
+                  .account-row {
+                      display: flex;
+                      justify-content: space-between;
+                      color: #666;
+                      font-size: 13px;
+                      padding: 5px 0;
+                  }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <h1>🔐 ZTA Auth Portal</h1>
+                  <p class="subtitle">Hub-and-Spoke Zero Trust Architecture</p>
+                  
+                  <div id="loginForm">
+                      <div id="error" class="error"></div>
+                      <div id="success" class="success"></div>
+                      
+                      <div class="form-group">
+                          <label>Username</label>
+                          <input type="text" id="username" placeholder="Enter username">
+                      </div>
+                      <div class="form-group">
+                          <label>Password</label>
+                          <input type="password" id="password" placeholder="Enter password">
+                      </div>
+                      <button onclick="login()">Login</button>
+                      
+                      <div class="accounts-info">
+                          <h4>Test Accounts:</h4>
+                          <div class="account-row"><span>aws_user / aws123</span><span>AWS Only</span></div>
+                          <div class="account-row"><span>full_user / full123</span><span>AWS + OS</span></div>
+                          <div class="account-row"><span>monitor / monitor123</span><span>Monitoring</span></div>
+                      </div>
+                  </div>
+                  
+                  <div id="userPanel" class="user-info">
+                      <h3>Welcome, <span id="displayName"></span></h3>
+                      <p>Role: <span id="userRole"></span></p>
+                      <div class="permissions" id="permissionsList"></div>
+                      
+                      <div class="nav-links" id="navLinks"></div>
+                      
+                      <button class="logout-btn" onclick="logout()">Logout</button>
+                  </div>
+              </div>
+              
+              <script>
+                  function login() {
+                      const username = document.getElementById('username').value;
+                      const password = document.getElementById('password').value;
+                      const errorDiv = document.getElementById('error');
+                      const successDiv = document.getElementById('success');
+                      
+                      errorDiv.style.display = 'none';
+                      successDiv.style.display = 'none';
+                      
+                      fetch('/api/login', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ username, password })
+                      })
+                      .then(res => res.json())
+                      .then(data => {
+                          if (data.success) {
+                              localStorage.setItem('jwt_token', data.token);
+                              localStorage.setItem('user_info', JSON.stringify(data.user));
+                              showUserPanel(data.user);
+                          } else {
+                              errorDiv.textContent = data.error || 'Login failed';
+                              errorDiv.style.display = 'block';
+                          }
+                      })
+                      .catch(err => {
+                          errorDiv.textContent = 'Connection error';
+                          errorDiv.style.display = 'block';
+                      });
+                  }
+                  
+                  function showUserPanel(user) {
+                      document.getElementById('loginForm').style.display = 'none';
+                      document.getElementById('userPanel').style.display = 'block';
+                      document.getElementById('displayName').textContent = user.name;
+                      document.getElementById('userRole').textContent = user.role;
+                      
+                      const permList = document.getElementById('permissionsList');
+                      permList.innerHTML = user.permissions.map(p => 
+                          `<span class="permission-badge">${p}</span>`
+                      ).join('');
+                      
+                      // Build navigation based on permissions
+                      const navLinks = document.getElementById('navLinks');
+                      const hasAws = user.permissions.includes('aws:read');
+                      const hasOs = user.permissions.includes('os:fetch');
+                      const hasMonitor = user.permissions.includes('monitor:read');
+                      
+                      let links = '';
+                      links += `<a href="/aws/" class="nav-link ${hasAws ? '' : 'disabled'}">
+                          📊 AWS Cluster Dashboard</a>`;
+                      links += `<a href="/monitoring/" class="nav-link ${hasMonitor ? '' : 'disabled'}">
+                          📈 Monitoring Dashboard</a>`;
+                      
+                      navLinks.innerHTML = links;
+                  }
+                  
+                  function logout() {
+                      localStorage.removeItem('jwt_token');
+                      localStorage.removeItem('user_info');
+                      document.getElementById('loginForm').style.display = 'block';
+                      document.getElementById('userPanel').style.display = 'none';
+                  }
+                  
+                  // Check if already logged in
+                  window.onload = function() {
+                      const userInfo = localStorage.getItem('user_info');
+                      if (userInfo) {
+                          try {
+                              showUserPanel(JSON.parse(userInfo));
+                          } catch(e) {
+                              logout();
+                          }
+                      }
+                  }
+              </script>
+          </body>
+          </html>
+
+    - name: Enable nginx site
+      file:
+        src: /etc/nginx/sites-available/auth-portal
+        dest: /etc/nginx/sites-enabled/auth-portal
+        state: link
+
+    - name: Reload nginx
+      service:
+        name: nginx
+        state: reloaded
+
+
+- name: Deploy AWS Gateway with JWT Validation (Native Python - No Docker)
+  hosts: vm-aws-gateway
+  become: yes
+  tasks:
+    - name: Create directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /opt/aws-frontend
+        - /opt/aws-gateway
+
+    - name: Create AWS Gateway API Server (validates JWT)
+      copy:
+        dest: /opt/aws-gateway/api-server.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          """
+          AWS Gateway API Server
+          - Validates JWT tokens from Authorization header
+          - Checks permissions before allowing access
+          - Proxies requests to OS Cluster if authorized
+          """
+          import json
+          import base64
+          import hmac
+          import hashlib
+          import time
+          import urllib.request
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          
+          JWT_SECRET = "zta-hub-spoke-secret-key-2024"
+          OS_GATEWAY_URL = "http://10.10.2.5:8080"
+          
+          def base64url_decode(data):
+              padding = 4 - len(data) % 4
+              if padding != 4:
+                  data += '=' * padding
+              return base64.urlsafe_b64decode(data)
+          
+          def verify_jwt(token):
+              """Verify JWT signature and extract payload"""
+              try:
+                  parts = token.split('.')
+                  if len(parts) != 3:
+                      return None, "Invalid token format"
+                  
+                  header_b64, payload_b64, signature_b64 = parts
+                  
+                  # Verify signature
+                  message = f"{header_b64}.{payload_b64}"
+                  expected_sig = hmac.new(
+                      JWT_SECRET.encode(), 
+                      message.encode(), 
+                      hashlib.sha256
+                  ).digest()
+                  
+                  actual_sig = base64url_decode(signature_b64)
+                  
+                  if not hmac.compare_digest(expected_sig, actual_sig):
+                      return None, "Invalid signature"
+                  
+                  # Decode payload
+                  payload = json.loads(base64url_decode(payload_b64))
+                  
+                  # Check expiration
+                  if payload.get('exp', 0) < time.time():
+                      return None, "Token expired"
+                  
+                  return payload, None
+                  
+              except Exception as e:
+                  return None, f"Token verification failed: {str(e)}"
+          
+          def check_permission(permissions, required):
+              """Check if user has required permission"""
+              return required in permissions
+          
+          class GatewayHandler(BaseHTTPRequestHandler):
+              def send_json(self, status, data):
+                  self.send_response(status)
+                  self.send_header('Content-Type', 'application/json')
+                  self.send_header('Access-Control-Allow-Origin', '*')
+                  self.end_headers()
+                  self.wfile.write(json.dumps(data).encode())
+              
+              def do_OPTIONS(self):
+                  self.send_response(200)
+                  self.send_header('Access-Control-Allow-Origin', '*')
+                  self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+                  self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+                  self.end_headers()
+              
+              def get_jwt_payload(self):
+                  """Extract and verify JWT from Authorization header"""
+                  auth_header = self.headers.get('Authorization', '')
+                  
+                  if not auth_header.startswith('Bearer '):
+                      return None, "Missing or invalid Authorization header"
+                  
+                  token = auth_header[7:]  # Remove "Bearer " prefix
+                  return verify_jwt(token)
+              
+              def do_GET(self):
+                  # Health check - no auth needed
+                  if self.path == '/health':
+                      self.send_json(200, {"status": "healthy", "service": "aws-gateway"})
+                      return
+                  
+                  # AWS Data endpoint
+                  if self.path == '/api/aws-data':
+                      payload, error = self.get_jwt_payload()
+                      
+                      if error:
+                          self.send_json(401, {"error": error, "authorized": False})
+                          return
+                      
+                      if not check_permission(payload.get('permissions', []), 'aws:read'):
+                          self.send_json(403, {
+                              "error": "Permission denied",
+                              "required": "aws:read",
+                              "your_permissions": payload.get('permissions', [])
+                          })
+                          return
+                      
+                      # Authorized - return AWS data
+                      self.send_json(200, {
+                          "authorized": True,
+                          "user": payload.get('sub'),
+                          "service": "AWS Cluster",
+                          "data": {
+                              "cluster_name": "aws-production",
+                              "region": "ap-southeast-1",
+                              "nodes": [
+                                  {"id": "aws-node-1", "status": "running", "cpu": "45%", "memory": "62%"},
+                                  {"id": "aws-node-2", "status": "running", "cpu": "38%", "memory": "55%"},
+                                  {"id": "aws-node-3", "status": "running", "cpu": "52%", "memory": "71%"}
+                              ],
+                              "total_pods": 47,
+                              "healthy_pods": 45
+                          }
+                      })
+                      return
+                  
+                  # OS Cluster Data endpoint - GATEWAY VALIDATES JWT HERE
+                  if self.path.startswith('/os/') or self.path == '/api/os-data':
+                      payload, error = self.get_jwt_payload()
+                      
+                      if error:
+                          print(f"[GATEWAY] OS access DENIED - {error}")
+                          self.send_json(401, {"error": error, "authorized": False})
+                          return
+                      
+                      # CHECK PERMISSION - THIS IS WHERE GATEWAY ENFORCES AUTHORIZATION
+                      if not check_permission(payload.get('permissions', []), 'os:fetch'):
+                          print(f"[GATEWAY] OS access DENIED for {payload.get('sub')} - missing os:fetch permission")
+                          self.send_json(403, {
+                              "error": "Access Denied - You don't have permission to fetch OS Cluster data",
+                              "required_permission": "os:fetch",
+                              "your_permissions": payload.get('permissions', []),
+                              "user": payload.get('sub'),
+                              "message": "Contact administrator for os:fetch permission"
+                          })
+                          return
+                      
+                      # AUTHORIZED - Proxy to OS Cluster
+                      print(f"[GATEWAY] OS access ALLOWED for {payload.get('sub')}")
+                      try:
+                          req = urllib.request.Request(f"{OS_GATEWAY_URL}/api/data")
+                          with urllib.request.urlopen(req, timeout=5) as response:
+                              os_data = json.loads(response.read().decode())
+                              self.send_json(200, {
+                                  "authorized": True,
+                                  "user": payload.get('sub'),
+                                  "source": "os-cluster",
+                                  "gateway_verified": True,
+                                  "data": os_data
+                              })
+                      except Exception as e:
+                          self.send_json(200, {
+                              "authorized": True,
+                              "user": payload.get('sub'),
+                              "source": "os-cluster",
+                              "gateway_verified": True,
+                              "data": {
+                                  "cluster_name": "openstack-production",
+                                  "instances": 12,
+                                  "networks": 5,
+                                  "status": "healthy"
+                              },
+                              "note": "Mock data - OS Gateway unreachable"
+                          })
+                      return
+                  
+                  self.send_json(404, {"error": "Not found"})
+              
+              def log_message(self, format, *args):
+                  print(f"[GATEWAY] {self.client_address[0]} - {args[0]}")
+          
+          if __name__ == '__main__':
+              server = HTTPServer(('0.0.0.0', 8080), GatewayHandler)
+              print("AWS Gateway API Server running on port 8080")
+              print("JWT validation enabled - Gateway enforces authorization")
+              server.serve_forever()
+
+    - name: Create AWS Frontend UI
+      copy:
+        dest: /opt/aws-frontend/index.html
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>AWS Cluster Dashboard - ZTA</title>
+              <style>
+                  * { margin: 0; padding: 0; box-sizing: border-box; }
+                  body { 
+                      font-family: 'Segoe UI', sans-serif;
+                      background: linear-gradient(135deg, #0d1117 0%, #161b22 100%);
+                      min-height: 100vh;
+                      color: #c9d1d9;
+                      padding: 20px;
+                  }
+                  .header {
+                      display: flex;
+                      justify-content: space-between;
+                      align-items: center;
+                      padding: 20px;
+                      background: rgba(255,255,255,0.05);
+                      border-radius: 12px;
+                      margin-bottom: 20px;
+                  }
+                  .header h1 { color: #58a6ff; }
+                  .user-badge {
+                      background: rgba(88,166,255,0.2);
+                      padding: 8px 16px;
+                      border-radius: 20px;
+                      color: #58a6ff;
+                  }
+                  .grid {
+                      display: grid;
+                      grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+                      gap: 20px;
+                  }
+                  .card {
+                      background: rgba(255,255,255,0.05);
+                      border-radius: 12px;
+                      padding: 20px;
+                      border: 1px solid rgba(255,255,255,0.1);
+                  }
+                  .card h2 {
+                      color: #58a6ff;
+                      margin-bottom: 15px;
+                      display: flex;
+                      align-items: center;
+                      gap: 10px;
+                  }
+                  .data-row {
+                      display: flex;
+                      justify-content: space-between;
+                      padding: 10px 0;
+                      border-bottom: 1px solid rgba(255,255,255,0.05);
+                  }
+                  .status-running { color: #3fb950; }
+                  .status-error { color: #f85149; }
+                  .fetch-btn {
+                      background: linear-gradient(135deg, #238636, #2ea043);
+                      border: none;
+                      padding: 12px 24px;
+                      border-radius: 8px;
+                      color: white;
+                      cursor: pointer;
+                      font-size: 14px;
+                      width: 100%;
+                      margin-top: 10px;
+                  }
+                  .fetch-btn:hover { opacity: 0.9; }
+                  .fetch-btn:disabled {
+                      background: #484f58;
+                      cursor: not-allowed;
+                  }
+                  .result-box {
+                      margin-top: 15px;
+                      padding: 15px;
+                      background: rgba(0,0,0,0.3);
+                      border-radius: 8px;
+                      font-family: monospace;
+                      font-size: 13px;
+                      white-space: pre-wrap;
+                      max-height: 300px;
+                      overflow-y: auto;
+                  }
+                  .error-box {
+                      background: rgba(248,81,73,0.1);
+                      border: 1px solid rgba(248,81,73,0.3);
+                      color: #f85149;
+                  }
+                  .success-box {
+                      background: rgba(63,185,80,0.1);
+                      border: 1px solid rgba(63,185,80,0.3);
+                      color: #3fb950;
+                  }
+                  .permission-check {
+                      padding: 10px;
+                      margin: 10px 0;
+                      border-radius: 8px;
+                      font-size: 14px;
+                  }
+                  .has-permission {
+                      background: rgba(63,185,80,0.1);
+                      color: #3fb950;
+                  }
+                  .no-permission {
+                      background: rgba(248,81,73,0.1);
+                      color: #f85149;
+                  }
+                  .back-link {
+                      display: inline-block;
+                      margin-bottom: 20px;
+                      color: #58a6ff;
+                      text-decoration: none;
+                  }
+                  .auth-warning {
+                      background: rgba(248,81,73,0.2);
+                      border: 1px solid rgba(248,81,73,0.5);
+                      padding: 20px;
+                      border-radius: 12px;
+                      text-align: center;
+                      margin-bottom: 20px;
+                  }
+              </style>
+          </head>
+          <body>
+              <a href="/" class="back-link">← Back to Auth Portal</a>
+              
+              <div id="authWarning" class="auth-warning" style="display:none;">
+                  <h2>⚠️ Not Authenticated</h2>
+                  <p>Please login first at the <a href="/" style="color:#58a6ff;">Auth Portal</a></p>
+              </div>
+              
+              <div id="mainContent">
+                  <div class="header">
+                      <h1>📊 AWS Cluster Dashboard</h1>
+                      <div class="user-badge" id="userBadge">Loading...</div>
+                  </div>
+                  
+                  <div class="grid">
+                      <div class="card">
+                          <h2>☁️ AWS Cluster Data</h2>
+                          <div id="awsPermCheck" class="permission-check"></div>
+                          <button class="fetch-btn" onclick="fetchAwsData()" id="awsFetchBtn">
+                              Fetch AWS Data
+                          </button>
+                          <div id="awsResult" class="result-box" style="display:none;"></div>
+                      </div>
+                      
+                      <div class="card">
+                          <h2>🖥️ OS Cluster Data</h2>
+                          <div id="osPermCheck" class="permission-check"></div>
+                          <p style="color:#8b949e; margin-bottom:10px; font-size:13px;">
+                              ⚡ Gateway validates JWT before proxying to OS Cluster
+                          </p>
+                          <button class="fetch-btn" onclick="fetchOsData()" id="osFetchBtn">
+                              Fetch OS Data (via Gateway)
+                          </button>
+                          <div id="osResult" class="result-box" style="display:none;"></div>
+                      </div>
+                  </div>
+              </div>
+              
+              <script>
+                  const token = localStorage.getItem('jwt_token');
+                  const userInfo = JSON.parse(localStorage.getItem('user_info') || '{}');
+                  
+                  if (!token) {
+                      document.getElementById('authWarning').style.display = 'block';
+                      document.getElementById('mainContent').style.opacity = '0.3';
+                  } else {
+                      document.getElementById('userBadge').textContent = 
+                          `${userInfo.name || 'User'} (${userInfo.role || 'unknown'})`;
+                      
+                      // Show permission status
+                      const perms = userInfo.permissions || [];
+                      
+                      const awsCheck = document.getElementById('awsPermCheck');
+                      if (perms.includes('aws:read')) {
+                          awsCheck.className = 'permission-check has-permission';
+                          awsCheck.textContent = '✓ You have aws:read permission';
+                      } else {
+                          awsCheck.className = 'permission-check no-permission';
+                          awsCheck.textContent = '✗ Missing aws:read permission';
+                      }
+                      
+                      const osCheck = document.getElementById('osPermCheck');
+                      if (perms.includes('os:fetch')) {
+                          osCheck.className = 'permission-check has-permission';
+                          osCheck.textContent = '✓ You have os:fetch permission';
+                      } else {
+                          osCheck.className = 'permission-check no-permission';
+                          osCheck.textContent = '✗ Missing os:fetch permission - Gateway will DENY access';
+                      }
+                  }
+                  
+                  async function fetchAwsData() {
+                      const resultDiv = document.getElementById('awsResult');
+                      resultDiv.style.display = 'block';
+                      resultDiv.className = 'result-box';
+                      resultDiv.textContent = 'Fetching AWS data...';
+                      
+                      try {
+                          const res = await fetch('/api/aws-data', {
+                              headers: { 'Authorization': `Bearer ${token}` }
+                          });
+                          const data = await res.json();
+                          
+                          if (res.ok) {
+                              resultDiv.className = 'result-box success-box';
+                          } else {
+                              resultDiv.className = 'result-box error-box';
+                          }
+                          resultDiv.textContent = JSON.stringify(data, null, 2);
+                      } catch (err) {
+                          resultDiv.className = 'result-box error-box';
+                          resultDiv.textContent = 'Error: ' + err.message;
+                      }
+                  }
+                  
+                  async function fetchOsData() {
+                      const resultDiv = document.getElementById('osResult');
+                      resultDiv.style.display = 'block';
+                      resultDiv.className = 'result-box';
+                      resultDiv.textContent = 'Gateway validating JWT and checking os:fetch permission...';
+                      
+                      try {
+                          const res = await fetch('/api/os-data', {
+                              headers: { 'Authorization': `Bearer ${token}` }
+                          });
+                          const data = await res.json();
+                          
+                          if (res.ok && data.authorized) {
+                              resultDiv.className = 'result-box success-box';
+                              resultDiv.textContent = '✓ GATEWAY AUTHORIZED\n\n' + JSON.stringify(data, null, 2);
+                          } else {
+                              resultDiv.className = 'result-box error-box';
+                              resultDiv.textContent = '✗ GATEWAY DENIED ACCESS\n\n' + JSON.stringify(data, null, 2);
+                          }
+                      } catch (err) {
+                          resultDiv.className = 'result-box error-box';
+                          resultDiv.textContent = 'Error: ' + err.message;
+                      }
+                  }
+              </script>
+          </body>
+          </html>
+
+    - name: Create systemd service for Gateway API
+      copy:
+        dest: /etc/systemd/system/aws-gateway.service
+        content: |
+          [Unit]
+          Description=AWS Gateway API Server with JWT Validation
+          After=network.target
+          
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/python3 /opt/aws-gateway/api-server.py
+          Restart=always
+          RestartSec=5
+          
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start Gateway API service
+      systemd:
+        name: aws-gateway
+        state: restarted
+        daemon_reload: yes
+        enabled: yes
+
+    - name: Update nginx for AWS Gateway
+      copy:
+        dest: /etc/nginx/sites-available/default
+        content: |
+          server {
+              listen 80;
+              server_name _;
+              
+              # Serve AWS Frontend UI
+              location / {
+                  root /opt/aws-frontend;
+                  index index.html;
+                  try_files $uri $uri/ /index.html;
+              }
+              
+              # AWS API - proxied to local Gateway API server
+              location /api/aws-data {
+                  proxy_pass http://127.0.0.1:8080;
+                  proxy_set_header Authorization $http_authorization;
+              }
+              
+              # OS API - Gateway validates JWT then proxies to OS Cluster
+              location /api/os-data {
+                  proxy_pass http://127.0.0.1:8080;
+                  proxy_set_header Authorization $http_authorization;
+              }
+              
+              location /os/ {
+                  proxy_pass http://127.0.0.1:8080;
+                  proxy_set_header Authorization $http_authorization;
+              }
+          }
+
+    - name: Reload nginx
+      service:
+        name: nginx
+        state: reloaded
+
+
+- name: Deploy OS Gateway API (data source)
+  hosts: vm-os-gateway
+  become: yes
+  tasks:
+    - name: Create OS Gateway directory
+      file:
+        path: /opt/os-gateway
+        state: directory
+        mode: '0755'
+
+    - name: Create OS Gateway API Server
+      copy:
+        dest: /opt/os-gateway/api-server.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          """
+          OS Cluster Gateway API Server
+          - Provides OpenStack cluster data
+          - Access controlled by AWS Gateway (JWT validation)
+          """
+          import json
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          
+          class OSHandler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path == '/api/data' or self.path == '/':
+                      self.send_response(200)
+                      self.send_header('Content-Type', 'application/json')
+                      self.end_headers()
+                      
+                      data = {
+                          "cluster_name": "openstack-production",
+                          "api_version": "v3",
+                          "region": "RegionOne",
+                          "compute": {
+                              "total_instances": 24,
+                              "running": 22,
+                              "stopped": 2,
+                              "vcpus_used": 96,
+                              "vcpus_total": 256,
+                              "memory_used_gb": 384,
+                              "memory_total_gb": 1024
+                          },
+                          "network": {
+                              "networks": 8,
+                              "subnets": 12,
+                              "routers": 4,
+                              "floating_ips": 15,
+                              "security_groups": 23
+                          },
+                          "storage": {
+                              "volumes": 45,
+                              "snapshots": 12,
+                              "total_size_gb": 2048,
+                              "used_size_gb": 1250
+                          },
+                          "projects": [
+                              {"name": "production", "instances": 15},
+                              {"name": "staging", "instances": 6},
+                              {"name": "development", "instances": 3}
+                          ]
+                      }
+                      self.wfile.write(json.dumps(data).encode())
+                      return
+                  
+                  if self.path == '/health':
+                      self.send_response(200)
+                      self.send_header('Content-Type', 'application/json')
+                      self.end_headers()
+                      self.wfile.write(json.dumps({"status": "healthy"}).encode())
+                      return
+                  
+                  self.send_response(404)
+                  self.end_headers()
+              
+              def log_message(self, format, *args):
+                  print(f"[OS-GW] {args[0]}")
+          
+          if __name__ == '__main__':
+              server = HTTPServer(('0.0.0.0', 8080), OSHandler)
+              print("OS Gateway API Server running on port 8080")
+              server.serve_forever()
+
+    - name: Create systemd service for OS Gateway
+      copy:
+        dest: /etc/systemd/system/os-gateway.service
+        content: |
+          [Unit]
+          Description=OS Gateway API Server
+          After=network.target
+          
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/python3 /opt/os-gateway/api-server.py
+          Restart=always
+          RestartSec=5
+          
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start OS Gateway service
+      systemd:
+        name: os-gateway
+        state: restarted
+        daemon_reload: yes
+        enabled: yes

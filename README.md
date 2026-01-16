@@ -1,4 +1,4 @@
-# 🔐 Zero Trust Architecture - Multi-Cloud Implementation
+# 🔐 Zero Trust Architecture - Hub-and-Spoke Multi-Cloud
 
 <div align="center">
 
@@ -6,90 +6,132 @@
 ![OpenStack](https://img.shields.io/badge/Platform-OpenStack-red)
 ![Terraform](https://img.shields.io/badge/IaC-Terraform-purple)
 ![Ansible](https://img.shields.io/badge/Config-Ansible-black)
-![License](https://img.shields.io/badge/License-MIT-green)
+![SPIRE](https://img.shields.io/badge/Identity-SPIRE%201.8.7-orange)
 
-**Enterprise-grade Zero Trust Architecture for Multi-Cloud Environments**
+**Enterprise Zero Trust Architecture with SPIRE, mTLS, and WireGuard Hub-Spoke**
 
-[Quick Start](#-quick-start) • [User Guide](#-user-guide) • [Admin Guide](#-admin-guide) • [Architecture](#-architecture) • [Evaluation](#-evaluation)
+[Quick Start](#-quick-start) • [Architecture](#-architecture) • [Components](#-components) • [Testing](#-testing)
 
 </div>
 
 ---
 
-## 📋 Table of Contents
+## 📋 Overview
 
-- [Overview](#-overview)
-- [Quick Start](#-quick-start)
-- [User Guide](#-user-guide)
-- [Admin Guide](#-admin-guide)
-- [Architecture](#-architecture)
-- [Configuration](#-configuration)
-- [Evaluation & Testing](#-evaluation)
-- [Troubleshooting](#-troubleshooting)
+Implementation of **Zero Trust Architecture (ZTA)** with **Hub-and-Spoke** network topology, featuring:
 
----
-
-## 🎯 Overview
-
-This project implements a complete **Zero Trust Architecture (ZTA)** across a multi-cloud environment (AWS + OpenStack simulation). It follows the core Zero Trust principles:
+- **SPIRE** for workload identity (SVID X.509 certificates with 5-minute rotation)
+- **WireGuard** for secure tunnel between gateways
+- **Envoy + OPA** for policy enforcement with JWT validation
+- **mTLS** for service-to-service authentication
 
 > **"Never Trust, Always Verify"**
 
-### Key Features
+---
 
-| Feature | Technology | Description |
-|---------|-----------|-------------|
-| 🔑 **Identity Provider** | Keycloak 23.0.4 | JWT-based authentication with 15-min token lifetime |
-| 📜 **Policy Engine** | OPA (Open Policy Agent) | Real-time policy decisions using Rego language |
-| 🛡️ **Service Mesh** | Envoy Proxy v1.28 | JWT validation + mTLS enforcement |
-| 🔒 **Workload Identity** | SPIRE 1.8.7 | Auto-rotating X.509 certificates (5-min TTL) |
-| 🌐 **Secure Tunnel** | WireGuard | Encrypted cross-cloud communication |
-| 📊 **Observability** | Prometheus + Grafana + Loki | Full-stack monitoring & logging |
+## 🏗️ Architecture
+
+### Network Topology
+
+```
+                       ┌─────────────────┐
+                       │    INTERNET     │
+                       └────────┬────────┘
+                                │
+                    ┌───────────┴────────────┐
+                    │                        │                     
+                    ▼                        ▼                      
+     ┌──────────────────────────┐  ┌─────────────────────────────────────────┐
+     │   DMZ (10.50.1.0/24)     │  │      Observability (10.40.1.0/24)       │
+     │   ══════════════════     │  │      ═══════════════════════════        │
+     │                          │  │                                         │
+     │  ┌────────────────────┐  │  │  ┌─────────────────┐  ┌──────────────┐  │
+     │  │   AUTH PORTAL ★    │  │  │  │  vm-monitoring  │  │ vm-identity  │  │
+     │  │  172.10.10.170     │  │  │  │  10.40.1.10     │  │  10.40.1.20  │  │
+     │  │  (THE ONLY PUBLIC) │  │  │  │  (NO public IP) │  │              │  │
+     │  │                    │  │  │  │                 │  │              │  │
+     │  │  • Login UI (:80)  │  │  │  │  • Prometheus   │  │ • SPIRE      │  │
+     │  │  • JWT API (:8888) │  │  │  │  • Grafana      │  │   Server     │  │
+     │  │  • WireGuard Hub   │  │  │  │  • Jaeger       │  │   (:8081)    │  │
+     │  │    (10.99.0.100)   │  │  │  └─────────────────┘  └──────────────┘  │
+     │  └────────────────────┘  │  │                                         │
+     └──────────────────────────┘  └─────────────────────────────────────────┘
+                    │                              
+                    │router-dmz (HUB)    
+                    │════════════════    
+                    │                              
+         ┌──────────┴──────────┐                   
+         │   WireGuard Tunnel  │                   
+         │   10.99.0.0/24      │                   
+         └──────────┬──────────┘                   
+                    │                              
+         ┌──────────┴──────────┐
+         │                     │
+         ▼                     ▼
+┌─────────────────────────┐   ┌─────────────────────────┐
+│  AWS Cloud              │   │  OS Cloud               │
+│  (10.20.2.0/24)         │   │  (10.10.2.0/24)         │
+│  ═══════════════        │   │  ═════════════          │
+│                         │   │                         │
+│  ┌───────────────────┐  │   │  ┌───────────────────┐  │
+│  │  AWS GATEWAY      │  │   │  │  OS GATEWAY       │  │
+│  │  10.20.2.5        │  │   │  │  10.10.2.5        │  │
+│  │  WG: 10.99.0.1    │◄─────►│  WG: 10.99.0.2     │  │
+│  │                   │ mTLS │  │                   │  │
+│  │  • OPA (:9191)    │  │   │  │  • Envoy mTLS     │  │
+│  │  • Envoy (:8080)  │  │   │  │    (:443)         │  │
+│  │  • SPIRE Agent    │  │   │  │  • SPIRE Agent    │  │
+│  └───────────────────┘  │   │  └───────────────────┘  │
+│           │             │   │           │             │
+│  ┌───────────────────┐  │   │  ┌───────────────────┐  │
+│  │  AWS Cluster      │  │   │  │  OS Cluster       │  │
+│  │  10.20.2.10       │  │   │  │  10.10.2.10       │  │
+│  │  K3s (UI Pods)    │  │   │  │  K3s (Backend)    │  │
+│  └───────────────────┘  │   │  └───────────────────┘  │
+└─────────────────────────┘   └─────────────────────────┘
+```
 
 ### Security Layers
 
+| Layer             | Technology    | Description                                        |
+|-------------------|---------------|----------------------------------------------------|
+| **L1: Network**   | Hub-and-Spoke | Isolated networks, no direct cross-network         |
+| **L2: Tunnel**    | WireGuard     | Encrypted tunnel between Auth Portal → Gateways    |
+| **L3: Identity**  | SPIRE/SVID    | Workload identity with 5-minute certificate rotation |
+| **L4: AuthN**     | JWT (HS256)   | Token-based authentication, 15-minute lifetime     |
+| **L5: AuthZ**     | OPA/Rego      | Real-time policy decisions                         |
+| **L6: Transport** | mTLS          | Mutual TLS between AWS ↔ OS Gateways               |
+
+---
+
+## 🔧 Components
+
+### VMs & Services
+
+| VM | Network | IP | Public | Services |
+|----|---------|-----|:------:|----------|
+| **vm-auth-portal** | DMZ | 10.50.1.10 | ✅ 172.10.10.170 | Login UI, JWT Server, WireGuard Hub |
+| **vm-identity** | Observability | 10.40.1.20 | ❌ | SPIRE Server |
+| **vm-monitoring** | Observability | 10.40.1.10 | ❌ | Prometheus, Grafana, Jaeger, Loki, Promtail |
+| **vm-aws-gateway** | Cloud AWS | 10.20.2.5 | ❌ | OPA, Envoy, SPIRE Agent, WG Spoke |
+| **vm-os-gateway** | Cloud OS | 10.10.2.5 | ❌ | Envoy mTLS, SPIRE Agent, WG Spoke |
+| **aws-master** | Cloud AWS | 10.20.2.10 | ❌ | K3s - UI Pods |
+| **os-master** | Cloud OS | 10.10.2.10 | ❌ | K3s - Backend API Pods |
+
+> ⚠️ **Zero Trust**: Only Auth Portal has public IP. All other services accessed via Auth Portal proxy or SSH tunnel.
+
+### Request Flow
+
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                          ZERO TRUST ARCHITECTURE FLOW                                │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                      │
-│                              ┌─────────────────┐                                    │
-│                              │    INTERNET     │                                    │
-│                              │     (Users)     │                                    │
-│                              └────────┬────────┘                                    │
-│                                       │                                             │
-│                                       ▼                                             │
-│  ╔═══════════════════════════════════════════════════════════════════════════════╗ │
-│  ║                    AWS GATEWAY - Single Entry Point                           ║ │
-│  ║                         (Public IP: Floating)                                 ║ │
-│  ╠═══════════════════════════════════════════════════════════════════════════════╣ │
-│  ║  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ║ │
-│  ║  │   Envoy     │───►│  Keycloak   │───►│    OPA      │───►│   mTLS      │    ║ │
-│  ║  │  (Gateway)  │    │  (AuthN)    │    │  (Policy)   │    │  (Tunnel)   │    ║ │
-│  ║  │  :80/:8080  │    │  JWT Token  │    │  Rego Rules │    │  WireGuard  │    ║ │
-│  ║  └─────────────┘    └─────────────┘    └─────────────┘    └──────┬──────┘    ║ │
-│  ╚══════════════════════════════════════════════════════════════════╪═══════════╝ │
-│                                                                      │              │
-│                          PRIVATE NETWORK (Internal Only)             │              │
-│        ┌─────────────────────────────────────────────────────────────┘              │
-│        │                                                                            │
-│        ▼                                                                            │
-│  ┌───────────────┐         ┌───────────────┐         ┌───────────────┐             │
-│  │   Frontend    │         │   Monitoring  │         │    Backend    │             │
-│  │   (AWS K3s)   │         │   (Keycloak,  │         │   (OS K3s)    │             │
-│  │   :30090      │         │   Prometheus, │         │   :30091      │             │
-│  │               │         │   Grafana)    │         │               │             │
-│  └───────────────┘         └───────────────┘         └───────────────┘             │
-│                                                                                      │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│  Security Layers:                                                                    │
-│    Layer 1: Perimeter Defense   → AWS Gateway (single entry, all traffic filtered) │
-│    Layer 2: Identity Verification → Keycloak JWT (15-min lifetime)                  │
-│    Layer 3: Policy Enforcement   → OPA Rego (real-time decisions)                  │
-│    Layer 4: Transport Security   → mTLS + WireGuard (encrypted tunnel)             │
-│    Layer 5: Workload Identity    → SPIRE SVID (5-min auto-rotation)                │
-│    Layer 6: Network Segmentation → VPC Isolation (no direct Internet access)       │
-└─────────────────────────────────────────────────────────────────────────────────────┘
+┌──────────┐    ┌──────────────┐    ┌─────────────────┐    ┌───────────────┐    ┌──────────────┐
+│  User    │───►│ Auth Portal  │───►│  AWS Gateway    │───►│  OS Gateway   │───►│  Backend Pod │
+│          │    │              │    │                 │    │               │    │              │
+│          │    │ 1. Login     │    │ 3. OPA Check    │    │ 5. mTLS       │    │ 6. Response  │
+│          │    │ 2. Get JWT   │    │ 4. Route        │    │    Terminate  │    │              │
+└──────────┘    └──────────────┘    └─────────────────┘    └───────────────┘    └──────────────┘
+                       │                    │                      │
+                       │              WireGuard Tunnel             │
+                       └───────────────────────────────────────────┘
 ```
 
 ---
@@ -98,392 +140,132 @@ This project implements a complete **Zero Trust Architecture (ZTA)** across a mu
 
 ### Prerequisites
 
-- OpenStack cloud access with admin privileges
-- Ubuntu 22.04+ control node
-- SSH key pair configured
-- OpenStack RC file sourced
+- OpenStack environment with Neutron networking
+- Terraform >= 1.0
+- Ansible >= 2.9
+- SSH keypair (`~/.ssh/id_rsa_zerotrust`)
 
-### One-Command Deployment
+### Deploy Infrastructure
 
 ```bash
-# 1. Clone repository
-git clone https://github.com/your-org/zta-multicloud.git
-cd zta-multicloud
-
-# 2. Configure environment
+# 1. Clone and setup
+cd /etc/zta-multicloud
 cp .env.example .env
-nano .env  # Edit your settings
 
-# 3. Source OpenStack credentials
-source ~/your-openstack-rc.sh
+# 2. Deploy Terraform (VMs + Networks)
+cd terraform-openstack
+source /etc/kolla/zerotrust-openrc.sh
+terraform init && terraform apply -auto-approve
 
-# 4. Deploy everything
+# 3. Deploy ZTA Stack with Ansible
+cd ../ansible-zta
+ansible-playbook -i inventory/hosts.ini deploy-zta-hub-spoke.yml
+```
+
+### Or Use All-in-One Script
+
+```bash
 ./zta-full-deploy.sh
 ```
 
-**⏱️ Deployment Time:** ~15-20 minutes
-
 ---
 
-## 👤 User Guide
+## 🧪 Testing
 
-This section is for **end users** who want to access the Zero Trust protected application.
+### User Accounts (RBAC Demo)
 
-### Accessing the Application
+| User | Password | Permissions | Access |
+|------|----------|-------------|--------|
+| **viewer** | viewer123 | `aws:ui` | AWS UI only |
+| **aws_user** | aws123 | `aws:ui`, `aws:read` | AWS UI + AWS data API |
+| **full_user** | full123 | `aws:ui`, `aws:read`, `os:read` | AWS UI + AWS data + OS data |
+| **admin** | admin123 | All permissions | Full access including monitoring |
 
-| Service | URL | Description |
-|---------|-----|-------------|
-| 🌐 **Web Application** | `http://<AWS_GATEWAY_IP>/` | Main application frontend |
+### API Endpoints
 
-> **Default IPs after deployment:** AWS Gateway = `172.10.10.181`
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/api/login` | POST | None | Get JWT token |
+| `/api/users` | GET | JWT | List users |
+| `/api/aws/data` | GET | JWT + `aws:read` | AWS data (requires aws:read) |
+| `/api/os/data` | GET | JWT + `os:read` | OS data (requires os:read) |
 
-### Login Flow
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    USER AUTHENTICATION FLOW                      │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  1. Open Browser ──► http://172.10.10.181/                      │
-│                                                                  │
-│  2. Click "Login (Keycloak)"                                    │
-│     ├── Enter Username: demo                                    │
-│     └── Enter Password: demo123                                 │
-│                                                                  │
-│  3. Upon success: "Authentication successful! JWT stored."      │
-│                                                                  │
-│  4. Click "Fetch Secure Data"                                   │
-│     └── View data from Private Cloud (OS Gateway)              │
-│                                                                  │
-│  5. Click "Logout" when done                                    │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Test Credentials
-
-| Username | Password | Role | Access Level |
-|----------|----------|------|--------------|
-| `demo` | `demo123` | User | Read access to `/api/secure-data` |
-
-### What Happens Behind the Scenes
-
-When you click "Fetch Secure Data":
-
-1. **JWT Validation**: Envoy checks your token with Keycloak
-2. **Policy Check**: OPA evaluates if you can access `/api/`
-3. **mTLS Tunnel**: Request goes through encrypted WireGuard tunnel
-4. **Certificate Verification**: OS Gateway verifies client certificate
-5. **Backend Response**: Data returned from Private Cloud
-
-### Troubleshooting for Users
-
-| Issue | Solution |
-|-------|----------|
-| "Please login first!" | Click Login button and authenticate |
-| "Authentication failed" | Check username/password (demo/demo123) |
-| "Access denied: HTTP 401" | Token expired, login again |
-| "Access denied: HTTP 403" | You don't have permission for this resource |
-| Page not loading | Check if AWS Gateway is accessible |
-
----
-
-## 🔧 Admin Guide
-
-This section is for **administrators** who manage the Zero Trust infrastructure.
-
-### Infrastructure Overview
-
-```
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                           INFRASTRUCTURE TOPOLOGY                                       │
-│                      (Single Entry Point Architecture)                                  │
-├────────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                         │
-│                                   INTERNET                                              │
-│                                      │                                                  │
-│                                      │ All external traffic                            │
-│                                      ▼                                                  │
-│  ╔════════════════════════════════════════════════════════════════════════════════════╗│
-│  ║                 AWS GATEWAY (Single Public Entry Point)                            ║│
-│  ║                      Floating IP: 172.10.10.181                                    ║│
-│  ║  ┌────────────────────────────────────────────────────────────────────────────┐   ║│
-│  ║  │  Envoy Proxy (:80/:8080)  │  OPA Policy (:8181)  │  WireGuard (:51820)    │   ║│
-│  ║  │  • JWT Validation         │  • Access Control     │  • Encrypted Tunnel   │   ║│
-│  ║  │  • Route Management       │  • Rego Policies      │  • mTLS Certs         │   ║│
-│  ║  └────────────────────────────────────────────────────────────────────────────┘   ║│
-│  ╚═══════════════════════════╤════════════════════════════════════════════════════════╝│
-│                               │                                                         │
-│            INTERNAL NETWORK   │  (No Direct Internet Access)                           │
-│      ┌────────────────────────┼─────────────────────────────────┐                      │
-│      │                        │                                 │                      │
-│      ▼                        ▼                                 ▼                      │
-│  ┌───────────────┐     ┌────────────────┐              ┌───────────────────┐          │
-│  │  AWS CLOUD    │     │  MANAGEMENT    │   WireGuard  │   OPENSTACK CLOUD │          │
-│  │  10.20.2.0/24 │     │  10.30.1.0/24  │   Tunnel     │   10.10.2.0/24    │          │
-│  │               │     │                │  ─────────►  │                   │          │
-│  │ ┌───────────┐ │     │ ┌────────────┐ │              │ ┌───────────────┐ │          │
-│  │ │  K3s      │ │     │ │ Keycloak   │ │              │ │  OS Gateway   │ │          │
-│  │ │  Frontend │ │     │ │ (Identity) │ │              │ │  (mTLS :443)  │ │          │
-│  │ │  :30090   │ │     │ │ :8080      │ │              │ │               │ │          │
-│  │ └───────────┘ │     │ ├────────────┤ │              │ │ ┌───────────┐ │ │          │
-│  │               │     │ │ SPIRE      │ │              │ │ │ K3s       │ │ │          │
-│  │               │     │ │ Server     │ │              │ │ │ Backend   │ │ │          │
-│  │               │     │ │ :8081      │ │              │ │ │ :30091    │ │ │          │
-│  │               │     │ ├────────────┤ │              │ │ └───────────┘ │ │          │
-│  │               │     │ │ Prometheus │ │              │ │               │ │          │
-│  │               │     │ │ Grafana    │ │              │ │               │ │          │
-│  │               │     │ │ Loki       │ │              │ └───────────────┘ │          │
-│  │               │     │ └────────────┘ │              │                   │          │
-│  └───────────────┘     └────────────────┘              └───────────────────┘          │
-│                                                                                         │
-├────────────────────────────────────────────────────────────────────────────────────────┤
-│  Traffic Flow:                                                                          │
-│    Internet → AWS Gateway (Auth+Policy) → WireGuard Tunnel → OS Gateway → Backend     │
-│                     ▲                                              │                    │
-│                     └──────────── Response Path ◄──────────────────┘                   │
-└────────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Admin Access Points
-
-| Service | URL | Credentials | Purpose |
-|---------|-----|-------------|---------|
-| **Grafana** | `http://<MONITORING_IP>:3000` | admin / admin | Metrics Dashboard |
-| **Prometheus** | `http://<MONITORING_IP>:9090` | - | Query Metrics |
-| **Loki** | `http://<MONITORING_IP>:3100` | - | Log Aggregation |
-| **Jaeger** | `http://<MONITORING_IP>:16686` | - | Distributed Tracing |
-| **Keycloak Admin** | `http://<IDENTITY_IP>:8080` | admin / Admin@123 | Identity Management |
-| **OPA API** | `http://<AWS_GATEWAY_IP>:8181` | - | Policy Management |
-| **Envoy Admin (AWS)** | `http://<AWS_GATEWAY_IP>:9901` | - | Proxy Stats |
-| **Envoy Admin (OS)** | `http://<OS_GATEWAY_IP>:9901` | - | Proxy Stats |
-
-> **Default IPs:** Monitoring=`172.10.10.172`, Identity=`10.30.1.20`, AWS=`172.10.10.181`, OS=`172.10.10.171`
-
-### SSH Access
+### E2E Test Commands
 
 ```bash
-# SSH to any VM
-SSH_KEY="~/.ssh/openstack-key.pem"
-SSH_OPTS="-o StrictHostKeyChecking=no -o IdentitiesOnly=yes"
+# 1. Get JWT Token for admin
+JWT=$(curl -s -X POST http://172.10.10.170:8888/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}' | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 
-# AWS Gateway
-ssh $SSH_OPTS -i $SSH_KEY ubuntu@172.10.10.181
+# 2. Test AWS Data API
+curl -s -H "Authorization: Bearer $JWT" http://172.10.10.170:8888/api/aws/data
+# Expected: {"data": {"service": "AWS Cluster", ...}}
 
-# OS Gateway
-ssh $SSH_OPTS -i $SSH_KEY ubuntu@172.10.10.171
+# 3. Test OS Data API  
+curl -s -H "Authorization: Bearer $JWT" http://172.10.10.170:8888/api/os/data
+# Expected: {"data": {"service": "OS Cluster", ...}}
 
-# Monitoring
-ssh $SSH_OPTS -i $SSH_KEY ubuntu@172.10.10.172
+# 4. Test RBAC - viewer cannot access /api/aws/data
+VIEWER_JWT=$(curl -s -X POST http://172.10.10.170:8888/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"viewer","password":"viewer123"}' | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+
+curl -s -H "Authorization: Bearer $VIEWER_JWT" http://172.10.10.170:8888/api/aws/data
+# Expected: {"error": "Insufficient permissions"}
 ```
 
-### Managing Components
-
-#### Keycloak - User Management
+### Run Full Evaluation Test
 
 ```bash
-# SSH to Monitoring VM, then to Identity VM
-ssh ubuntu@172.10.10.172
-ssh ubuntu@10.30.1.20
-
-# Access Keycloak CLI
-docker exec -it keycloak /opt/keycloak/bin/kcadm.sh
-
-# Create new user
-docker exec keycloak /opt/keycloak/bin/kcadm.sh create users -r zta \
-  -s username=newuser -s enabled=true
-docker exec keycloak /opt/keycloak/bin/kcadm.sh set-password -r zta \
-  --username newuser --new-password newpass123
-```
-
-#### OPA - Policy Management
-
-```bash
-# SSH to AWS Gateway
-ssh ubuntu@172.10.10.181
-
-# View current policies
-curl http://localhost:8181/v1/policies
-
-# Update policy
-sudo nano /opt/opa/policy.rego
-sudo docker restart opa
-```
-
-#### Certificate Management
-
-```bash
-# View certificate expiry
-ssh ubuntu@172.10.10.181 "openssl x509 -in /opt/certs/ca-cert.pem -noout -dates"
-
-# Regenerate certificates (if needed)
-ssh ubuntu@172.10.10.181 "cd /opt/certs && sudo ./regenerate-certs.sh"
-```
-
-#### Service Management
-
-```bash
-# Check service status
-ssh ubuntu@172.10.10.181 "sudo docker ps"
-ssh ubuntu@172.10.10.172 "sudo systemctl status spire-server"
-
-# Restart services
-ssh ubuntu@172.10.10.181 "sudo docker restart envoy-aws opa"
-ssh ubuntu@172.10.10.171 "sudo docker restart envoy-os"
-
-# View logs
-ssh ubuntu@172.10.10.181 "sudo docker logs envoy-aws --tail 100"
-ssh ubuntu@172.10.10.181 "sudo docker logs opa --tail 100"
-```
-
-### Monitoring & Alerting
-
-#### Grafana Dashboards
-
-1. Open `http://172.10.10.172:3000`
-2. Login: admin / admin
-3. Add Data Sources:
-   - Prometheus: `http://localhost:9090`
-   - Loki: `http://localhost:3100`
-
-#### Key Metrics to Monitor
-
-| Metric | Query | Alert Threshold |
-|--------|-------|-----------------|
-| Auth Failures | `sum(rate(envoy_http_downstream_rq_4xx[5m]))` | > 10/min |
-| Response Time | `histogram_quantile(0.95, envoy_http_downstream_rq_time_bucket)` | > 500ms |
-| OPA Decisions | `opa_decision_total{result="deny"}` | > 100/min |
-| Certificate Expiry | Custom script | < 30 days |
-
-### Backup & Recovery
-
-```bash
-# Backup Keycloak
-ssh ubuntu@10.30.1.20 "docker exec keycloak /opt/keycloak/bin/kc.sh export --dir /tmp/backup"
-
-# Backup OPA Policies
-scp ubuntu@172.10.10.181:/opt/opa/*.rego ./backup/
-
-# Backup Certificates
-scp ubuntu@172.10.10.181:/opt/certs/*.pem ./backup/certs/
-```
-
----
-
-## 🏗️ Architecture
-
-### Component Details
-
-#### Identity Layer (Keycloak)
-- **Realm**: `zta`
-- **Client**: `zta-web` (public client, direct access grants)
-- **Token Lifetime**: 15 minutes
-- **Supported Flows**: Password Grant, Authorization Code
-
-#### Policy Layer (OPA)
-- **Decision Endpoint**: `:9191` (gRPC for Envoy)
-- **Management API**: `:8181` (REST)
-- **Policies**:
-  - `policy.rego`: HTTP authorization rules
-  - `spiffe_policy.rego`: Service-to-service authorization
-
-#### Gateway Layer (Envoy)
-- **AWS Gateway** (`:8080` → `:80` via iptables):
-  - JWT validation against Keycloak
-  - Route `/auth/token` → Keycloak
-  - Route `/api/*` → OS Gateway (mTLS)
-  - Route `/` → Frontend K3s
-
-- **OS Gateway** (`:443` TLS):
-  - mTLS client certificate validation
-  - Route `/api/*` → Backend K3s
-
-#### Network Layer (WireGuard)
-- **AWS Gateway**: `10.99.0.1/24`
-- **OS Gateway**: `10.99.0.2/24`
-- **Port**: UDP 51820
-
----
-
-## ⚙️ Configuration
-
-### Environment Variables
-
-Copy `.env.example` to `.env` and configure:
-
-```bash
-cp .env.example .env
-```
-
-See [.env.example](.env.example) for all available options.
-
-### Key Configuration Files
-
-| File | Purpose |
-|------|---------|
-| `.env` | Environment variables |
-| `ansible-zta/site.yml` | Main Ansible playbook |
-| `terraform-openstack/main.tf` | Infrastructure definition |
-| `ansible-zta/inventory/hosts.ini` | Generated inventory |
-
----
-
-## 📊 Evaluation
-
-### Running Tests
-
-```bash
-# Comprehensive evaluation
+# Run all tests
 ./zta-evaluation-test.sh
+
+# Run demo scenario only
+./zta-evaluation-test.sh -d
+
+# Run full demo with explanations
+./zta-evaluation-test.sh -f
 ```
 
-### Test Categories
-
-| Category | Tests | Description |
-|----------|-------|-------------|
-| **Security** | Authentication, Authorization, mTLS, Lateral Movement | Verify Zero Trust principles |
-| **Operations** | Service Health, Certificate Management, Automation | Operational readiness |
-| **Performance** | Latency, Throughput, Resource Usage | Performance benchmarks |
-| **E2E Flow** | Complete user journey | End-to-end validation |
-
-### Expected Results
+### Test Results Summary
 
 ```
-Security:     ✓ Keycloak JWT, OPA Policies, mTLS, WireGuard
-Operations:   ✓ Terraform IaC, Ansible Automation, Health Checks
-Performance:  ✓ Auth <500ms, E2E <100ms, Throughput >10 req/s
+╔═════════════════════════════════════════════════════════════════╗
+║           🎯 ZTA EVALUATION TEST SUMMARY                        ║
+╠═════════════════════════════════════════════════════════════════╣
+║  ✅ Test Passed: 40/40 (100%)                                   ║
+║                                                                 ║
+║  Sections:                                                      ║
+║  • I.   Environment Check         ✓                             ║
+║  • II.  Network Connectivity      ✓                             ║
+║  • III. RBAC & JWT (4 users)      ✓                             ║
+║  • IV.  SPIRE Identity            ✓                             ║
+║  • V.   WireGuard Tunnel          ✓                             ║
+║  • VI.  Gateway Communication     ✓                             ║
+║  • VII. Monitoring Stack          ✓                             ║
+║  • VIII.User Scenario Demo        ✓                             ║
+╚═════════════════════════════════════════════════════════════════╝
 ```
 
----
-
-## 🔍 Troubleshooting
-
-### Common Issues
-
-| Issue | Cause | Solution |
-|-------|-------|----------|
-| SSH "Permission denied" | Wrong key | Use `-o IdentitiesOnly=yes -i ~/.ssh/openstack-key.pem` |
-| "Keycloak unreachable" | Network bridge down | Restart `keycloak-proxy` service |
-| "JWT issuer mismatch" | Wrong issuer in Envoy | Update `aws_gateway_public_ip` in config |
-| "mTLS handshake failed" | Certificate mismatch | Sync CA certificates between gateways |
-| Envoy not starting | Port conflict | Check if port 8080 is in use |
-
-### Debug Commands
+### Verify SPIRE SVIDs
 
 ```bash
-# Check Envoy logs
-ssh ubuntu@172.10.10.181 "sudo docker logs envoy-aws 2>&1 | tail -50"
+# On AWS Gateway
+sudo /opt/spire/bin/spire-agent api fetch x509 -socketPath /opt/spire/run/agent.sock
+# Shows: spiffe://zta.local/workload/aws-service
 
-# Test JWT manually
-curl -X POST http://172.10.10.181/auth/token \
-  -d "username=demo&password=demo123&grant_type=password&client_id=zta-web"
+# On OS Gateway  
+sudo /opt/spire/bin/spire-agent api fetch x509 -socketPath /opt/spire/run/agent.sock
+# Shows: spiffe://zta.local/workload/os-service
+```
 
-# Test mTLS
-ssh ubuntu@172.10.10.181 "curl -k --cert /opt/certs/aws-client-cert.pem \
-  --key /opt/certs/aws-client-key.pem https://10.99.0.2:443/api/health"
+### Verify WireGuard Tunnel
 
-# Check WireGuard
-ssh ubuntu@172.10.10.181 "sudo wg show"
+```bash
+# On Auth Portal (Hub)
+sudo wg show wg0
+# Should show 2 peers: 10.99.0.1 (AWS) and 10.99.0.2 (OS)
 ```
 
 ---
@@ -491,57 +273,109 @@ ssh ubuntu@172.10.10.181 "sudo wg show"
 ## 📁 Project Structure
 
 ```
-zta-multicloud/
-├── .env.example                 # Environment template
-├── .gitignore                   # Git ignore rules
-├── README.md                    # This file
-├── zta-full-deploy.sh          # Main deployment script
-├── zta-evaluation-test.sh      # Comprehensive test suite
-├── cleanup.sh                   # Destroy all resources
-│
-├── ansible-zta/                 # Ansible configuration
-│   ├── ansible.cfg             # Ansible settings
-│   ├── site.yml                # Main playbook
-│   └── inventory/              # Generated inventory
-│       ├── hosts.ini
-│       └── group_vars/
-│
-├── terraform-openstack/         # Terraform IaC
-│   └── main.tf                 # Infrastructure definition
-│
-└── docs/                        # Documentation
-    └── architecture.md
+/etc/zta-multicloud/
+├── terraform-openstack/
+│   └── main.tf              # Infrastructure as Code
+├── ansible-zta/
+│   ├── inventory/
+│   │   └── hosts.ini        # VM inventory
+│   ├── deploy-zta-hub-spoke.yml   # Main deployment
+│   ├── deploy-zta-complete.yml    # SPIRE deployment
+│   ├── deploy-auth-portal.yml     # Auth Portal only
+│   ├── deploy-jwt-gateway.yml     # JWT Gateway config
+│   └── site.yml                   # Full site config
+├── docs/
+│   ├── architecture.md      # Detailed architecture
+│   └── ssh-reference.md     # SSH quick reference
+├── logs/                    # Deployment logs
+├── zta-full-deploy.sh       # All-in-one deploy script
+├── zta-evaluation-test.sh   # E2E test script (40 tests)
+├── zta-demo-scenario.sh     # 4-user RBAC demo
+├── ssh-helper.sh            # Interactive SSH menu
+└── cleanup.sh               # Cleanup script
+```
+
+---
+
+## 🔑 Credentials
+
+| Service | Username | Password | Access |
+|---------|----------|----------|--------|
+| Auth Portal | viewer | viewer123 | AWS UI only |
+| Auth Portal | aws_user | aws123 | AWS UI + data |
+| Auth Portal | full_user | full123 | AWS + OS data |
+| Auth Portal | admin | admin123 | Full access |
+| Grafana | admin | admin | Via SSH tunnel |
+
+### Access Monitoring (No Public IP)
+
+```bash
+# SSH tunnel for Grafana
+ssh -L 3000:10.40.1.10:3000 -i ~/.ssh/id_rsa_zerotrust ubuntu@172.10.10.170
+# Then open: http://localhost:3000
+
+# SSH tunnel for Prometheus
+ssh -L 9090:10.40.1.10:9090 -i ~/.ssh/id_rsa_zerotrust ubuntu@172.10.10.170
+# Then open: http://localhost:9090
+```
+
+---
+
+## 📊 Ports Reference
+
+| Port | Service | Location |
+|------|---------|----------|
+| 80 | Auth Portal UI | vm-auth-portal |
+| 8888 | JWT API Server | vm-auth-portal |
+| 8080 | Envoy Proxy | vm-aws-gateway |
+| 9191 | OPA gRPC | vm-aws-gateway |
+| 443 | Envoy mTLS | vm-os-gateway |
+| 8081 | SPIRE Server | vm-identity |
+| 51820/UDP | WireGuard | All gateways |
+| 3000 | Grafana | vm-monitoring |
+| 9090 | Prometheus | vm-monitoring |
+
+---
+
+## 🛠️ Troubleshooting
+
+### SPIRE Agent Not Connecting
+```bash
+# Check agent logs
+sudo tail -f /var/log/spire-agent.log
+
+# Verify connectivity to SPIRE server
+nc -zv 10.40.1.20 8081
+```
+
+### WireGuard Tunnel Down
+```bash
+# Check WireGuard status
+sudo wg show wg0
+
+# Restart WireGuard
+sudo systemctl restart wg-quick@wg0
+```
+
+### OPA Returning 403 with Valid JWT
+```bash
+# Check OPA logs
+docker logs opa
+
+# Test OPA policy directly
+curl localhost:8181/v1/data/envoy/authz/allow
 ```
 
 ---
 
 ## 📜 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
----
-
-## 📞 Support
-
-- **Issues**: [GitHub Issues](https://github.com/your-org/zta-multicloud/issues)
-- **Documentation**: [Wiki](https://github.com/your-org/zta-multicloud/wiki)
+MIT License - See [LICENSE](LICENSE)
 
 ---
 
 <div align="center">
 
-**Built with ❤️ for Zero Trust Security**
+**Built for Zero Trust Multi-Cloud Security**
 
 </div>
-
-

@@ -1,0 +1,982 @@
+---
+# Update Auth Portal with Role-Based Access Control
+# 4 Types of Users (Zero Trust):
+# 1. viewer - AWS UI only (no data)
+# 2. aws_user - AWS UI + AWS data
+# 3. full_user - AWS UI + AWS data + OS data
+# 4. admin - Full access including monitoring
+
+- name: Update Auth Portal with RBAC
+  hosts: vm-auth-portal
+  become: yes
+  vars:
+    aws_gateway_ip: "10.20.2.5"
+    aws_master_ip: "10.20.2.10"
+    os_gateway_ip: "10.10.2.5"
+    os_master_ip: "10.10.2.10"
+    # Zero Trust: Monitoring has NO public IP
+    monitoring_internal_ip: "10.40.1.10"
+    auth_portal_public_ip: "{{ ansible_host }}"
+    
+    # User accounts with roles
+    users:
+      - username: "viewer"
+        password: "viewer123"
+        role: "viewer"
+        display_name: "Viewer (UI only)"
+      - username: "aws_user"
+        password: "aws123"
+        role: "aws_only"
+        display_name: "AWS Operator"
+      - username: "full_user"
+        password: "full123"
+        role: "full_access"
+        display_name: "Full Access User"
+      - username: "monitor"
+        password: "monitor123"
+        role: "monitoring"
+        display_name: "Monitoring Admin"
+  tasks:
+    - name: Create Auth Portal HTML with RBAC
+      copy:
+        dest: /opt/auth-portal/index.html
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>ZTA Auth Portal - Single Entry Point</title>
+            <style>
+              * { box-sizing: border-box; margin: 0; padding: 0; }
+              body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+                min-height: 100vh;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                color: #fff;
+              }
+              .container {
+                background: rgba(255, 255, 255, 0.1);
+                backdrop-filter: blur(10px);
+                border-radius: 20px;
+                padding: 40px;
+                width: 100%;
+                max-width: 480px;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+              }
+              h1 {
+                text-align: center;
+                margin-bottom: 10px;
+                font-size: 1.8rem;
+                background: linear-gradient(90deg, #00d4ff, #7c3aed);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+              }
+              .subtitle {
+                text-align: center;
+                color: #a0aec0;
+                margin-bottom: 25px;
+                font-size: 0.9rem;
+              }
+              .badge {
+                display: inline-block;
+                background: #7c3aed;
+                color: white;
+                padding: 4px 12px;
+                border-radius: 20px;
+                font-size: 0.75rem;
+                margin-bottom: 15px;
+              }
+              .hub-info {
+                background: rgba(0, 212, 255, 0.1);
+                border: 1px solid rgba(0, 212, 255, 0.3);
+                border-radius: 10px;
+                padding: 12px;
+                margin-bottom: 20px;
+                text-align: center;
+                font-size: 0.85rem;
+                color: #a0aec0;
+              }
+              .form-group { margin-bottom: 18px; }
+              label {
+                display: block;
+                margin-bottom: 6px;
+                color: #e2e8f0;
+                font-size: 0.9rem;
+              }
+              input {
+                width: 100%;
+                padding: 12px 14px;
+                border: 2px solid rgba(255, 255, 255, 0.1);
+                border-radius: 10px;
+                background: rgba(255, 255, 255, 0.05);
+                color: #fff;
+                font-size: 1rem;
+                transition: all 0.3s;
+              }
+              input:focus {
+                outline: none;
+                border-color: #7c3aed;
+                background: rgba(255, 255, 255, 0.1);
+              }
+              .btn {
+                width: 100%;
+                padding: 14px;
+                border: none;
+                border-radius: 10px;
+                font-size: 1rem;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.3s;
+              }
+              .btn-primary {
+                background: linear-gradient(135deg, #7c3aed, #5b21b6);
+                color: white;
+              }
+              .btn-primary:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 4px 20px rgba(124, 58, 237, 0.4);
+              }
+              .error-msg {
+                background: rgba(239, 68, 68, 0.2);
+                border: 1px solid #ef4444;
+                color: #fca5a5;
+                padding: 10px;
+                border-radius: 8px;
+                margin-bottom: 15px;
+                text-align: center;
+                display: none;
+              }
+              .users-hint {
+                margin-top: 20px;
+                padding: 15px;
+                background: rgba(0, 0, 0, 0.2);
+                border-radius: 10px;
+              }
+              .users-hint h4 {
+                color: #7c3aed;
+                margin-bottom: 10px;
+                font-size: 0.9rem;
+              }
+              .user-item {
+                display: flex;
+                justify-content: space-between;
+                padding: 8px 0;
+                border-bottom: 1px solid rgba(255,255,255,0.1);
+                font-size: 0.8rem;
+              }
+              .user-item:last-child { border-bottom: none; }
+              .user-role {
+                padding: 2px 8px;
+                border-radius: 4px;
+                font-size: 0.7rem;
+              }
+              .role-aws { background: #ff9900; color: #000; }
+              .role-full { background: #10b981; color: #fff; }
+              .role-monitor { background: #3b82f6; color: #fff; }
+              .footer {
+                text-align: center;
+                margin-top: 20px;
+                color: #64748b;
+                font-size: 0.75rem;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <div style="text-align: center;">
+                <span class="badge">🔒 Zero Trust Architecture</span>
+              </div>
+              <h1>🛡️ Auth Portal</h1>
+              <p class="subtitle">Hub-and-Spoke Single Entry Point</p>
+              
+              <div class="hub-info">
+                🌐 All traffic routes through this portal<br>
+                Internal services have no direct internet access
+              </div>
+              
+              <div id="errorMsg" class="error-msg"></div>
+              
+              <form id="loginForm">
+                <div class="form-group">
+                  <label>👤 Username</label>
+                  <input type="text" id="username" placeholder="Enter username" required>
+                </div>
+                <div class="form-group">
+                  <label>🔑 Password</label>
+                  <input type="password" id="password" placeholder="Enter password" required>
+                </div>
+                <button type="submit" class="btn btn-primary">🔐 Login</button>
+              </form>
+              
+              <div class="users-hint">
+                <h4>📋 Demo Accounts</h4>
+                <div class="user-item">
+                  <span><code>aws_user</code> / <code>aws123</code></span>
+                  <span class="user-role role-aws">AWS Only</span>
+                </div>
+                <div class="user-item">
+                  <span><code>full_user</code> / <code>full123</code></span>
+                  <span class="user-role role-full">Full Access</span>
+                </div>
+                <div class="user-item">
+                  <span><code>monitor</code> / <code>monitor123</code></span>
+                  <span class="user-role role-monitor">Monitoring</span>
+                </div>
+              </div>
+              
+              <div class="footer">
+                Auth Portal: {{ auth_portal_public_ip }} | Hub-and-Spoke ZTA
+              </div>
+            </div>
+            
+            <script>
+              // User database with roles
+              const users = {
+                'aws_user': { password: 'aws123', role: 'aws_only', name: 'AWS Operator' },
+                'full_user': { password: 'full123', role: 'full_access', name: 'Full Access User' },
+                'monitor': { password: 'monitor123', role: 'monitoring', name: 'Monitoring Admin' }
+              };
+              
+              document.getElementById('loginForm').addEventListener('submit', function(e) {
+                e.preventDefault();
+                const username = document.getElementById('username').value;
+                const password = document.getElementById('password').value;
+                const errorMsg = document.getElementById('errorMsg');
+                
+                if (users[username] && users[username].password === password) {
+                  const user = users[username];
+                  // Store user info in sessionStorage
+                  sessionStorage.setItem('user', JSON.stringify({
+                    username: username,
+                    role: user.role,
+                    name: user.name
+                  }));
+                  
+                  // Redirect based on role
+                  switch(user.role) {
+                    case 'aws_only':
+                      window.location.href = '/dashboard/aws';
+                      break;
+                    case 'full_access':
+                      window.location.href = '/dashboard/full';
+                      break;
+                    case 'monitoring':
+                      window.location.href = '/dashboard/monitor';
+                      break;
+                  }
+                } else {
+                  errorMsg.textContent = '❌ Invalid username or password';
+                  errorMsg.style.display = 'block';
+                  setTimeout(() => { errorMsg.style.display = 'none'; }, 3000);
+                }
+              });
+            </script>
+          </body>
+          </html>
+
+    - name: Create AWS Only Dashboard
+      copy:
+        dest: /opt/auth-portal/dashboard-aws.html
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>AWS Dashboard - ZTA</title>
+            <style>
+              * { box-sizing: border-box; margin: 0; padding: 0; }
+              body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                min-height: 100vh;
+                color: #fff;
+              }
+              .navbar {
+                background: rgba(0, 0, 0, 0.3);
+                padding: 15px 30px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                border-bottom: 1px solid rgba(255,255,255,0.1);
+              }
+              .navbar h2 {
+                background: linear-gradient(90deg, #ff9900, #ff6600);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+              }
+              .user-info {
+                display: flex;
+                align-items: center;
+                gap: 15px;
+              }
+              .user-badge {
+                background: #ff9900;
+                color: #000;
+                padding: 5px 12px;
+                border-radius: 20px;
+                font-size: 0.8rem;
+                font-weight: 600;
+              }
+              .logout-btn {
+                background: rgba(239, 68, 68, 0.2);
+                border: 1px solid #ef4444;
+                color: #fca5a5;
+                padding: 8px 16px;
+                border-radius: 8px;
+                cursor: pointer;
+                transition: all 0.3s;
+              }
+              .logout-btn:hover {
+                background: #ef4444;
+                color: #fff;
+              }
+              .content {
+                padding: 30px;
+                max-width: 1200px;
+                margin: 0 auto;
+              }
+              .welcome {
+                background: rgba(255, 153, 0, 0.1);
+                border: 1px solid rgba(255, 153, 0, 0.3);
+                border-radius: 15px;
+                padding: 25px;
+                margin-bottom: 30px;
+              }
+              .welcome h1 { margin-bottom: 10px; }
+              .services {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                gap: 20px;
+              }
+              .service-card {
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 15px;
+                padding: 25px;
+                transition: all 0.3s;
+              }
+              .service-card:hover {
+                transform: translateY(-5px);
+                box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+              }
+              .service-card.enabled { border-color: rgba(16, 185, 129, 0.5); }
+              .service-card.disabled { 
+                border-color: rgba(239, 68, 68, 0.3);
+                opacity: 0.6;
+              }
+              .service-card h3 { margin-bottom: 10px; }
+              .service-card p { color: #a0aec0; font-size: 0.9rem; margin-bottom: 15px; }
+              .service-btn {
+                display: inline-block;
+                padding: 10px 20px;
+                border-radius: 8px;
+                text-decoration: none;
+                font-weight: 600;
+                transition: all 0.3s;
+              }
+              .btn-aws {
+                background: linear-gradient(135deg, #ff9900, #ff6600);
+                color: #000;
+              }
+              .btn-disabled {
+                background: rgba(100, 100, 100, 0.3);
+                color: #666;
+                cursor: not-allowed;
+              }
+              .access-denied {
+                background: rgba(239, 68, 68, 0.1);
+                border: 1px solid rgba(239, 68, 68, 0.3);
+                color: #fca5a5;
+                padding: 10px;
+                border-radius: 8px;
+                font-size: 0.85rem;
+                margin-top: 10px;
+              }
+            </style>
+          </head>
+          <body>
+            <nav class="navbar">
+              <h2>☁️ AWS Dashboard</h2>
+              <div class="user-info">
+                <span id="userName"></span>
+                <span class="user-badge">AWS Only</span>
+                <button class="logout-btn" onclick="logout()">🚪 Logout</button>
+              </div>
+            </nav>
+            
+            <div class="content">
+              <div class="welcome">
+                <h1>👋 Welcome, <span id="welcomeName"></span>!</h1>
+                <p>You have access to AWS Cluster services only.</p>
+              </div>
+              
+              <div class="services">
+                <div class="service-card enabled">
+                  <h3>☁️ AWS Cluster UI</h3>
+                  <p>Access the AWS-simulated cluster frontend application.</p>
+                  <a href="/aws/" class="service-btn btn-aws">Open AWS Cluster →</a>
+                </div>
+                
+                <div class="service-card disabled">
+                  <h3>🔒 OS Cluster Data</h3>
+                  <p>Cross-cluster data fetching from OpenStack cluster.</p>
+                  <span class="service-btn btn-disabled">Access Denied</span>
+                  <div class="access-denied">
+                    ⚠️ Your role does not permit access to OS Cluster data.
+                    Contact admin to upgrade your access level.
+                  </div>
+                </div>
+                
+                <div class="service-card disabled">
+                  <h3>📊 Monitoring</h3>
+                  <p>Grafana, Prometheus, Jaeger dashboards.</p>
+                  <span class="service-btn btn-disabled">Access Denied</span>
+                  <div class="access-denied">
+                    ⚠️ Monitoring access requires 'monitor' role.
+                  </div>
+                </div>
+              </div>
+            </div>
+            
+            <script>
+              const user = JSON.parse(sessionStorage.getItem('user') || '{}');
+              if (!user.username || user.role !== 'aws_only') {
+                window.location.href = '/';
+              }
+              document.getElementById('userName').textContent = user.name;
+              document.getElementById('welcomeName').textContent = user.name;
+              
+              function logout() {
+                sessionStorage.clear();
+                window.location.href = '/';
+              }
+            </script>
+          </body>
+          </html>
+
+    - name: Create Full Access Dashboard
+      copy:
+        dest: /opt/auth-portal/dashboard-full.html
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Full Access Dashboard - ZTA</title>
+            <style>
+              * { box-sizing: border-box; margin: 0; padding: 0; }
+              body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                min-height: 100vh;
+                color: #fff;
+              }
+              .navbar {
+                background: rgba(0, 0, 0, 0.3);
+                padding: 15px 30px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                border-bottom: 1px solid rgba(255,255,255,0.1);
+              }
+              .navbar h2 {
+                background: linear-gradient(90deg, #10b981, #059669);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+              }
+              .user-info {
+                display: flex;
+                align-items: center;
+                gap: 15px;
+              }
+              .user-badge {
+                background: #10b981;
+                color: #fff;
+                padding: 5px 12px;
+                border-radius: 20px;
+                font-size: 0.8rem;
+                font-weight: 600;
+              }
+              .logout-btn {
+                background: rgba(239, 68, 68, 0.2);
+                border: 1px solid #ef4444;
+                color: #fca5a5;
+                padding: 8px 16px;
+                border-radius: 8px;
+                cursor: pointer;
+                transition: all 0.3s;
+              }
+              .logout-btn:hover {
+                background: #ef4444;
+                color: #fff;
+              }
+              .content {
+                padding: 30px;
+                max-width: 1200px;
+                margin: 0 auto;
+              }
+              .welcome {
+                background: rgba(16, 185, 129, 0.1);
+                border: 1px solid rgba(16, 185, 129, 0.3);
+                border-radius: 15px;
+                padding: 25px;
+                margin-bottom: 30px;
+              }
+              .welcome h1 { margin-bottom: 10px; }
+              .services {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                gap: 20px;
+              }
+              .service-card {
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(16, 185, 129, 0.3);
+                border-radius: 15px;
+                padding: 25px;
+                transition: all 0.3s;
+              }
+              .service-card:hover {
+                transform: translateY(-5px);
+                box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+              }
+              .service-card.disabled { 
+                border-color: rgba(239, 68, 68, 0.3);
+                opacity: 0.6;
+              }
+              .service-card h3 { margin-bottom: 10px; }
+              .service-card p { color: #a0aec0; font-size: 0.9rem; margin-bottom: 15px; }
+              .service-btn {
+                display: inline-block;
+                padding: 10px 20px;
+                border-radius: 8px;
+                text-decoration: none;
+                font-weight: 600;
+                transition: all 0.3s;
+              }
+              .btn-aws {
+                background: linear-gradient(135deg, #ff9900, #ff6600);
+                color: #000;
+              }
+              .btn-os {
+                background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+                color: #fff;
+              }
+              .btn-disabled {
+                background: rgba(100, 100, 100, 0.3);
+                color: #666;
+                cursor: not-allowed;
+              }
+              .access-denied {
+                background: rgba(239, 68, 68, 0.1);
+                border: 1px solid rgba(239, 68, 68, 0.3);
+                color: #fca5a5;
+                padding: 10px;
+                border-radius: 8px;
+                font-size: 0.85rem;
+                margin-top: 10px;
+              }
+              .full-access-note {
+                background: rgba(16, 185, 129, 0.15);
+                border: 1px solid rgba(16, 185, 129, 0.4);
+                padding: 10px;
+                border-radius: 8px;
+                font-size: 0.85rem;
+                margin-top: 10px;
+                color: #6ee7b7;
+              }
+            </style>
+          </head>
+          <body>
+            <nav class="navbar">
+              <h2>🌐 Full Access Dashboard</h2>
+              <div class="user-info">
+                <span id="userName"></span>
+                <span class="user-badge">Full Access</span>
+                <button class="logout-btn" onclick="logout()">🚪 Logout</button>
+              </div>
+            </nav>
+            
+            <div class="content">
+              <div class="welcome">
+                <h1>👋 Welcome, <span id="welcomeName"></span>!</h1>
+                <p>You have full access to AWS Cluster and can fetch data from OS Cluster.</p>
+              </div>
+              
+              <div class="services">
+                <div class="service-card">
+                  <h3>☁️ AWS Cluster UI</h3>
+                  <p>Access the AWS-simulated cluster frontend application.</p>
+                  <a href="/aws/" class="service-btn btn-aws">Open AWS Cluster →</a>
+                  <div class="full-access-note">
+                    ✅ Full access with OS data fetching enabled
+                  </div>
+                </div>
+                
+                <div class="service-card">
+                  <h3>🖥️ OS Cluster Data</h3>
+                  <p>Direct access to OpenStack cluster backend API.</p>
+                  <a href="/os/" class="service-btn btn-os">Open OS Cluster →</a>
+                  <div class="full-access-note">
+                    ✅ Cross-cluster data fetching enabled
+                  </div>
+                </div>
+                
+                <div class="service-card disabled">
+                  <h3>📊 Monitoring</h3>
+                  <p>Grafana, Prometheus, Jaeger dashboards.</p>
+                  <span class="service-btn btn-disabled">Access Denied</span>
+                  <div class="access-denied">
+                    ⚠️ Monitoring access requires 'monitor' role.
+                  </div>
+                </div>
+              </div>
+            </div>
+            
+            <script>
+              const user = JSON.parse(sessionStorage.getItem('user') || '{}');
+              if (!user.username || user.role !== 'full_access') {
+                window.location.href = '/';
+              }
+              document.getElementById('userName').textContent = user.name;
+              document.getElementById('welcomeName').textContent = user.name;
+              
+              function logout() {
+                sessionStorage.clear();
+                window.location.href = '/';
+              }
+            </script>
+          </body>
+          </html>
+
+    - name: Create Monitoring Dashboard
+      copy:
+        dest: /opt/auth-portal/dashboard-monitor.html
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Monitoring Dashboard - ZTA</title>
+            <style>
+              * { box-sizing: border-box; margin: 0; padding: 0; }
+              body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                min-height: 100vh;
+                color: #fff;
+              }
+              .navbar {
+                background: rgba(0, 0, 0, 0.3);
+                padding: 15px 30px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                border-bottom: 1px solid rgba(255,255,255,0.1);
+              }
+              .navbar h2 {
+                background: linear-gradient(90deg, #3b82f6, #1d4ed8);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+              }
+              .user-info {
+                display: flex;
+                align-items: center;
+                gap: 15px;
+              }
+              .user-badge {
+                background: #3b82f6;
+                color: #fff;
+                padding: 5px 12px;
+                border-radius: 20px;
+                font-size: 0.8rem;
+                font-weight: 600;
+              }
+              .logout-btn {
+                background: rgba(239, 68, 68, 0.2);
+                border: 1px solid #ef4444;
+                color: #fca5a5;
+                padding: 8px 16px;
+                border-radius: 8px;
+                cursor: pointer;
+                transition: all 0.3s;
+              }
+              .logout-btn:hover {
+                background: #ef4444;
+                color: #fff;
+              }
+              .content {
+                padding: 30px;
+                max-width: 1200px;
+                margin: 0 auto;
+              }
+              .welcome {
+                background: rgba(59, 130, 246, 0.1);
+                border: 1px solid rgba(59, 130, 246, 0.3);
+                border-radius: 15px;
+                padding: 25px;
+                margin-bottom: 30px;
+              }
+              .welcome h1 { margin-bottom: 10px; }
+              .services {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                gap: 20px;
+              }
+              .service-card {
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(59, 130, 246, 0.3);
+                border-radius: 15px;
+                padding: 25px;
+                transition: all 0.3s;
+              }
+              .service-card:hover {
+                transform: translateY(-5px);
+                box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+              }
+              .service-card.disabled { 
+                border-color: rgba(239, 68, 68, 0.3);
+                opacity: 0.6;
+              }
+              .service-card h3 { margin-bottom: 10px; }
+              .service-card p { color: #a0aec0; font-size: 0.9rem; margin-bottom: 15px; }
+              .service-btn {
+                display: inline-block;
+                padding: 10px 20px;
+                border-radius: 8px;
+                text-decoration: none;
+                font-weight: 600;
+                transition: all 0.3s;
+              }
+              .btn-grafana {
+                background: linear-gradient(135deg, #f46800, #e55100);
+                color: #fff;
+              }
+              .btn-prometheus {
+                background: linear-gradient(135deg, #e6522c, #c73e1d);
+                color: #fff;
+              }
+              .btn-jaeger {
+                background: linear-gradient(135deg, #00bcd4, #0097a7);
+                color: #fff;
+              }
+              .btn-disabled {
+                background: rgba(100, 100, 100, 0.3);
+                color: #666;
+                cursor: not-allowed;
+              }
+              .access-denied {
+                background: rgba(239, 68, 68, 0.1);
+                border: 1px solid rgba(239, 68, 68, 0.3);
+                color: #fca5a5;
+                padding: 10px;
+                border-radius: 8px;
+                font-size: 0.85rem;
+                margin-top: 10px;
+              }
+            </style>
+          </head>
+          <body>
+            <nav class="navbar">
+              <h2>📊 Monitoring Dashboard</h2>
+              <div class="user-info">
+                <span id="userName"></span>
+                <span class="user-badge">Monitor Admin</span>
+                <button class="logout-btn" onclick="logout()">🚪 Logout</button>
+              </div>
+            </nav>
+            
+            <div class="content">
+              <div class="welcome">
+                <h1>👋 Welcome, <span id="welcomeName"></span>!</h1>
+                <p>You have access to all monitoring and observability tools.</p>
+              </div>
+              
+              <div class="services">
+                <div class="service-card">
+                  <h3>📈 Grafana</h3>
+                  <p>Visualization and analytics platform for metrics.</p>
+                  <p style="color: #94a3b8; font-size: 12px;">Access via SSH tunnel: <code>ssh -L 3000:10.40.1.10:3000 ubuntu@172.10.10.170</code></p>
+                  <a href="http://localhost:3000" target="_blank" class="service-btn btn-grafana">Open Grafana (tunnel) →</a>
+                </div>
+                
+                <div class="service-card">
+                  <h3>🔥 Prometheus</h3>
+                  <p>Time-series metrics collection and alerting.</p>
+                  <p style="color: #94a3b8; font-size: 12px;">Access via SSH tunnel: <code>ssh -L 9090:10.40.1.10:9090 ubuntu@172.10.10.170</code></p>
+                  <a href="http://localhost:9090" target="_blank" class="service-btn btn-prometheus">Open Prometheus (tunnel) →</a>
+                </div>
+                
+                <div class="service-card">
+                  <h3>🔍 Jaeger</h3>
+                  <p>Distributed tracing for microservices.</p>
+                  <p style="color: #94a3b8; font-size: 12px;">Access via SSH tunnel: <code>ssh -L 16686:10.40.1.10:16686 ubuntu@172.10.10.170</code></p>
+                  <a href="http://localhost:16686" target="_blank" class="service-btn btn-jaeger">Open Jaeger (tunnel) →</a>
+                </div>
+                
+                <div class="service-card disabled">
+                  <h3>☁️ AWS / OS Clusters</h3>
+                  <p>Application cluster access.</p>
+                  <span class="service-btn btn-disabled">Access Denied</span>
+                  <div class="access-denied">
+                    ⚠️ Cluster access requires 'aws_only' or 'full_access' role.
+                  </div>
+                </div>
+              </div>
+            </div>
+            
+            <script>
+              const user = JSON.parse(sessionStorage.getItem('user') || '{}');
+              if (!user.username || user.role !== 'monitoring') {
+                window.location.href = '/';
+              }
+              document.getElementById('userName').textContent = user.name;
+              document.getElementById('welcomeName').textContent = user.name;
+              
+              function logout() {
+                sessionStorage.clear();
+                window.location.href = '/';
+              }
+            </script>
+          </body>
+          </html>
+
+    - name: Update nginx configuration with dashboard routes
+      copy:
+        dest: /opt/auth-portal/nginx.conf
+        content: |
+          events {
+              worker_connections 1024;
+          }
+          
+          http {
+              include /etc/nginx/mime.types;
+              default_type application/octet-stream;
+              
+              log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                              '$status $body_bytes_sent "$http_referer" '
+                              '"$http_user_agent"';
+              access_log /var/log/nginx/access.log main;
+              error_log /var/log/nginx/error.log warn;
+              
+              # Upstream servers (internal - Hub-and-Spoke)
+              upstream aws_frontend {
+                  server {{ aws_gateway_ip }}:80;
+              }
+              
+              upstream os_backend {
+                  server {{ os_gateway_ip }}:80;
+              }
+              
+              server {
+                  listen 80;
+                  server_name _;
+                  
+                  # Auth Portal Login Page
+                  location = / {
+                      root /usr/share/nginx/html;
+                      index index.html;
+                  }
+                  
+                  location = /index.html {
+                      root /usr/share/nginx/html;
+                  }
+                  
+                  # Dashboard routes
+                  location = /dashboard/aws {
+                      alias /usr/share/nginx/html/dashboard-aws.html;
+                      default_type text/html;
+                  }
+                  
+                  location = /dashboard/full {
+                      alias /usr/share/nginx/html/dashboard-full.html;
+                      default_type text/html;
+                  }
+                  
+                  location = /dashboard/monitor {
+                      alias /usr/share/nginx/html/dashboard-monitor.html;
+                      default_type text/html;
+                  }
+                  
+                  # AWS Cluster UI Proxy
+                  location /aws/ {
+                      proxy_pass http://aws_frontend/;
+                      proxy_http_version 1.1;
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                      proxy_set_header Upgrade $http_upgrade;
+                      proxy_set_header Connection "upgrade";
+                  }
+                  
+                  # OS Cluster API Proxy
+                  location /os/ {
+                      proxy_pass http://os_backend/;
+                      proxy_http_version 1.1;
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                  }
+                  
+                  # Health check
+                  location /health {
+                      return 200 'Auth Portal OK';
+                      add_header Content-Type text/plain;
+                  }
+              }
+          }
+
+    - name: Stop existing container
+      docker_container:
+        name: auth-portal
+        state: absent
+      ignore_errors: yes
+
+    - name: Deploy Auth Portal with RBAC
+      docker_container:
+        name: auth-portal
+        image: nginx:alpine
+        state: started
+        restart_policy: always
+        ports:
+          - "80:80"
+          - "8888:80"
+        volumes:
+          - /opt/auth-portal/index.html:/usr/share/nginx/html/index.html:ro
+          - /opt/auth-portal/dashboard-aws.html:/usr/share/nginx/html/dashboard-aws.html:ro
+          - /opt/auth-portal/dashboard-full.html:/usr/share/nginx/html/dashboard-full.html:ro
+          - /opt/auth-portal/dashboard-monitor.html:/usr/share/nginx/html/dashboard-monitor.html:ro
+          - /opt/auth-portal/nginx.conf:/etc/nginx/nginx.conf:ro
+
+    - name: Wait for Auth Portal
+      wait_for:
+        port: 80
+        delay: 3
+        timeout: 30
+
+    - name: Display login info
+      debug:
+        msg: |
+          ========================================
+          Auth Portal with RBAC is ready!
+          ========================================
+          URL: http://{{ auth_portal_public_ip }}
+          
+          Demo Accounts:
+          ┌────────────┬────────────┬─────────────────────────┐
+          │ Username   │ Password   │ Access                  │
+          ├────────────┼────────────┼─────────────────────────┤
+          │ aws_user   │ aws123     │ AWS Cluster only        │
+          │ full_user  │ full123    │ AWS + OS Cluster        │
+          │ monitor    │ monitor123 │ Grafana/Prometheus/Jaeger│
+          └────────────┴────────────┴─────────────────────────┘
+          ========================================

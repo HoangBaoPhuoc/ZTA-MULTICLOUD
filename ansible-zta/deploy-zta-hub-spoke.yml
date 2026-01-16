@@ -1,0 +1,1122 @@
+---
+################################################################################
+# ZTA Hub-and-Spoke Full Deployment
+# Architecture:
+#   - Auth Portal: Login UI only, issue JWT, redirect to AWS Gateway
+#   - AWS Gateway: OPA+Envoy (protect UI access with JWT)
+#   - AWS Cluster: UI Pods (K8s) - only accessible after JWT validation
+#   - OS Gateway: Envoy (mTLS termination)
+#   - OS Cluster: Backend API Pods (K8s)
+#   - mTLS between AWS Gateway <-> OS Gateway
+################################################################################
+
+#==============================================================================
+# PHASE 1: Generate mTLS Certificates (on localhost)
+#==============================================================================
+- name: Generate mTLS Certificates
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    cert_dir: /tmp/zta-certs
+    jwt_secret: "zta-hub-spoke-secret-key-2024"
+  tasks:
+    - name: Create certificate directory
+      file:
+        path: "{{ cert_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Generate CA private key
+      command: openssl genrsa -out {{ cert_dir }}/ca-key.pem 4096
+      args:
+        creates: "{{ cert_dir }}/ca-key.pem"
+
+    - name: Generate CA certificate
+      command: >
+        openssl req -new -x509 -days 3650 
+        -key {{ cert_dir }}/ca-key.pem 
+        -out {{ cert_dir }}/ca-cert.pem 
+        -subj "/C=VN/O=ZTA/CN=ZTA-CA"
+      args:
+        creates: "{{ cert_dir }}/ca-cert.pem"
+
+    - name: Generate AWS Gateway key and cert
+      shell: |
+        openssl genrsa -out {{ cert_dir }}/aws-gateway-key.pem 2048
+        openssl req -new -key {{ cert_dir }}/aws-gateway-key.pem -out {{ cert_dir }}/aws-gateway.csr -subj "/C=VN/O=ZTA/CN=aws-gateway"
+        openssl x509 -req -days 3650 -in {{ cert_dir }}/aws-gateway.csr -CA {{ cert_dir }}/ca-cert.pem -CAkey {{ cert_dir }}/ca-key.pem -CAcreateserial -out {{ cert_dir }}/aws-gateway-cert.pem
+      args:
+        creates: "{{ cert_dir }}/aws-gateway-cert.pem"
+
+    - name: Generate OS Gateway key and cert
+      shell: |
+        openssl genrsa -out {{ cert_dir }}/os-gateway-key.pem 2048
+        openssl req -new -key {{ cert_dir }}/os-gateway-key.pem -out {{ cert_dir }}/os-gateway.csr -subj "/C=VN/O=ZTA/CN=os-gateway"
+        openssl x509 -req -days 3650 -in {{ cert_dir }}/os-gateway.csr -CA {{ cert_dir }}/ca-cert.pem -CAkey {{ cert_dir }}/ca-key.pem -CAcreateserial -out {{ cert_dir }}/os-gateway-cert.pem
+      args:
+        creates: "{{ cert_dir }}/os-gateway-cert.pem"
+
+    - name: Save JWT secret
+      copy:
+        content: "{{ jwt_secret }}"
+        dest: "{{ cert_dir }}/jwt-secret.txt"
+
+#==============================================================================
+# PHASE 2: Deploy Auth Portal (Login UI Only)
+#==============================================================================
+- name: Deploy Auth Portal
+  hosts: vm_auth_portal
+  become: yes
+  vars:
+    jwt_secret: "zta-hub-spoke-secret-key-2024"
+    aws_gateway_ip: "{{ hostvars['vm-aws-gateway']['ansible_host'] }}"
+  tasks:
+    - name: Install nginx and python3
+      apt:
+        name: [nginx, python3]
+        state: present
+        update_cache: yes
+
+    - name: Create auth portal directory
+      file:
+        path: /opt/auth-portal
+        state: directory
+        mode: '0755'
+
+    - name: Create login-only portal UI
+      copy:
+        dest: /var/www/html/index.html
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>ZTA Authentication Portal</title>
+              <style>
+                  * { margin: 0; padding: 0; box-sizing: border-box; }
+                  body {
+                      font-family: 'Segoe UI', sans-serif;
+                      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+                      min-height: 100vh;
+                      display: flex;
+                      justify-content: center;
+                      align-items: center;
+                  }
+                  .login-container {
+                      background: rgba(255,255,255,0.1);
+                      backdrop-filter: blur(10px);
+                      border-radius: 20px;
+                      padding: 50px;
+                      width: 400px;
+                      box-shadow: 0 25px 50px rgba(0,0,0,0.3);
+                      border: 1px solid rgba(255,255,255,0.1);
+                  }
+                  .logo { text-align: center; margin-bottom: 30px; }
+                  .logo h1 { color: #00d9ff; font-size: 2em; }
+                  .logo p { color: #888; margin-top: 10px; }
+                  .form-group { margin-bottom: 20px; }
+                  .form-group label { color: #ccc; display: block; margin-bottom: 8px; }
+                  .form-group input {
+                      width: 100%;
+                      padding: 15px;
+                      border: none;
+                      border-radius: 10px;
+                      background: rgba(255,255,255,0.1);
+                      color: #fff;
+                      font-size: 16px;
+                  }
+                  .form-group input:focus { outline: 2px solid #00d9ff; }
+                  .btn-login {
+                      width: 100%;
+                      padding: 15px;
+                      border: none;
+                      border-radius: 10px;
+                      background: linear-gradient(90deg, #00d9ff, #0099cc);
+                      color: #fff;
+                      font-size: 18px;
+                      font-weight: 600;
+                      cursor: pointer;
+                      transition: transform 0.3s;
+                  }
+                  .btn-login:hover { transform: scale(1.02); }
+                  .btn-login:disabled { opacity: 0.6; cursor: not-allowed; }
+                  .error { background: #ff4444; color: #fff; padding: 15px; border-radius: 10px; margin-bottom: 20px; display: none; }
+                  .info { background: rgba(0,217,255,0.2); color: #00d9ff; padding: 15px; border-radius: 10px; margin-top: 20px; font-size: 14px; text-align: center; }
+              </style>
+          </head>
+          <body>
+              <div class="login-container">
+                  <div class="logo">
+                      <h1>🔐 ZTA Portal</h1>
+                      <p>Zero Trust Authentication</p>
+                  </div>
+                  <div class="error" id="error"></div>
+                  <form id="loginForm">
+                      <div class="form-group">
+                          <label>Username</label>
+                          <input type="text" id="username" required placeholder="Enter username">
+                      </div>
+                      <div class="form-group">
+                          <label>Password</label>
+                          <input type="password" id="password" required placeholder="Enter password">
+                      </div>
+                      <button type="submit" class="btn-login" id="loginBtn">Login & Access Dashboard</button>
+                  </form>
+                  <div class="info">
+                      After authentication, you will be redirected to the AWS Cluster Dashboard
+                  </div>
+              </div>
+              <script>
+                  const AWS_GATEWAY = 'http://{{ aws_gateway_ip }}';
+                  
+                  document.getElementById('loginForm').addEventListener('submit', async (e) => {
+                      e.preventDefault();
+                      const btn = document.getElementById('loginBtn');
+                      const error = document.getElementById('error');
+                      btn.disabled = true;
+                      btn.textContent = 'Authenticating...';
+                      error.style.display = 'none';
+                      
+                      try {
+                          const response = await fetch('/api/login', {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({
+                                  username: document.getElementById('username').value,
+                                  password: document.getElementById('password').value
+                              })
+                          });
+                          
+                          const data = await response.json();
+                          
+                          if (response.ok && data.token) {
+                              // Redirect to AWS Gateway with token
+                              window.location.href = AWS_GATEWAY + '/dashboard?token=' + encodeURIComponent(data.token);
+                          } else {
+                              throw new Error(data.error || 'Authentication failed');
+                          }
+                      } catch (err) {
+                          error.textContent = err.message;
+                          error.style.display = 'block';
+                          btn.disabled = false;
+                          btn.textContent = 'Login & Access Dashboard';
+                      }
+                  });
+              </script>
+          </body>
+          </html>
+
+    - name: Create JWT Auth Server
+      copy:
+        dest: /opt/auth-portal/auth-server.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          import json
+          import hashlib
+          import hmac
+          import base64
+          import time
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          
+          JWT_SECRET = "{{ jwt_secret }}"
+          
+          USERS = {
+              "admin": {"password": "admin123", "role": "admin", "permissions": ["aws:read", "aws:write", "os:read", "os:write"]},
+              "aws_user": {"password": "aws123", "role": "aws_viewer", "permissions": ["aws:read"]},
+              "os_user": {"password": "os123", "role": "os_viewer", "permissions": ["os:read"]},
+              "full_user": {"password": "full123", "role": "full_access", "permissions": ["aws:read", "os:read"]},
+          }
+          
+          def base64url_encode(data):
+              if isinstance(data, str):
+                  data = data.encode()
+              return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+          
+          def create_jwt(payload):
+              header = {"alg": "HS256", "typ": "JWT"}
+              header_b64 = base64url_encode(json.dumps(header))
+              payload_b64 = base64url_encode(json.dumps(payload))
+              message = f"{header_b64}.{payload_b64}"
+              signature = hmac.new(JWT_SECRET.encode(), message.encode(), hashlib.sha256).digest()
+              signature_b64 = base64url_encode(signature)
+              return f"{message}.{signature_b64}"
+          
+          class AuthHandler(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  if self.path == '/api/login':
+                      length = int(self.headers.get('Content-Length', 0))
+                      body = json.loads(self.rfile.read(length)) if length > 0 else {}
+                      
+                      username = body.get('username', '')
+                      password = body.get('password', '')
+                      
+                      if username in USERS and USERS[username]['password'] == password:
+                          user = USERS[username]
+                          now = int(time.time())
+                          payload = {
+                              "sub": username,
+                              "role": user['role'],
+                              "permissions": user['permissions'],
+                              "iat": now,
+                              "exp": now + 900,  # 15 minutes
+                              "iss": "zta-auth-portal"
+                          }
+                          token = create_jwt(payload)
+                          self.send_response(200)
+                          self.send_header('Content-Type', 'application/json')
+                          self.send_header('Access-Control-Allow-Origin', '*')
+                          self.end_headers()
+                          self.wfile.write(json.dumps({"token": token, "user": username}).encode())
+                      else:
+                          self.send_response(401)
+                          self.send_header('Content-Type', 'application/json')
+                          self.end_headers()
+                          self.wfile.write(json.dumps({"error": "Invalid credentials"}).encode())
+                  else:
+                      self.send_response(404)
+                      self.end_headers()
+              
+              def do_OPTIONS(self):
+                  self.send_response(200)
+                  self.send_header('Access-Control-Allow-Origin', '*')
+                  self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+                  self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+                  self.end_headers()
+              
+              def log_message(self, format, *args):
+                  print(f"[AUTH] {args[0]}")
+          
+          if __name__ == '__main__':
+              server = HTTPServer(('0.0.0.0', 8888), AuthHandler)
+              print("Auth Server running on port 8888")
+              server.serve_forever()
+
+    - name: Create auth server systemd service
+      copy:
+        dest: /etc/systemd/system/auth-server.service
+        content: |
+          [Unit]
+          Description=ZTA Auth Server
+          After=network.target
+          
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/python3 /opt/auth-portal/auth-server.py
+          Restart=always
+          RestartSec=3
+          
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Configure nginx for auth portal
+      copy:
+        dest: /etc/nginx/sites-available/default
+        content: |
+          server {
+              listen 80;
+              server_name _;
+              
+              # Login API
+              location /api/login {
+                  proxy_pass http://127.0.0.1:8888;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+              }
+              
+              # Static login page only
+              location / {
+                  root /var/www/html;
+                  index index.html;
+              }
+          }
+
+    - name: Enable and start services
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+      loop:
+        - auth-server
+        - nginx
+
+#==============================================================================
+# PHASE 3: Deploy OS Cluster - Backend Pods
+#==============================================================================
+- name: Deploy Backend Pods on OS Cluster
+  hosts: os-master
+  become: yes
+  tasks:
+    - name: Wait for K3s to be ready
+      command: kubectl get nodes
+      register: k3s_check
+      until: k3s_check.rc == 0
+      retries: 30
+      delay: 10
+
+    - name: Create backend namespace
+      shell: kubectl create namespace backend --dry-run=client -o yaml | kubectl apply -f -
+      args:
+        executable: /bin/bash
+
+    - name: Deploy Backend API Pods
+      copy:
+        dest: /tmp/backend-deployment.yaml
+        content: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: backend-api
+            namespace: backend
+          spec:
+            replicas: 3
+            selector:
+              matchLabels:
+                app: backend-api
+            template:
+              metadata:
+                labels:
+                  app: backend-api
+              spec:
+                containers:
+                - name: api
+                  image: python:3.9-slim
+                  imagePullPolicy: IfNotPresent
+                  ports:
+                  - containerPort: 8080
+                  command: ["/bin/bash", "-c"]
+                  args:
+                  - |
+                    mkdir -p /app && cat > /app/server.py << 'EOF'
+                    from http.server import HTTPServer, BaseHTTPRequestHandler
+                    import json
+                    import os
+                    import socket
+                    
+                    class BackendAPI(BaseHTTPRequestHandler):
+                        def do_GET(self):
+                            self.send_response(200)
+                            self.send_header('Content-Type', 'application/json')
+                            self.send_header('Access-Control-Allow-Origin', '*')
+                            self.end_headers()
+                            
+                            data = {
+                                "service": "OS Backend API",
+                                "pod": os.environ.get('HOSTNAME', 'unknown'),
+                                "node": socket.gethostname(),
+                                "data": {
+                                    "openstack_clusters": [
+                                        {"name": "prod-cluster", "status": "healthy", "nodes": 5},
+                                        {"name": "dev-cluster", "status": "healthy", "nodes": 3}
+                                    ],
+                                    "total_vms": 48,
+                                    "running_vms": 45,
+                                    "networks": 12,
+                                    "storage_tb": 24.5
+                                }
+                            }
+                            self.wfile.write(json.dumps(data, indent=2).encode())
+                        
+                        def log_message(self, format, *args):
+                            print(f"[BACKEND-API] {args[0]}")
+                    
+                    HTTPServer(('0.0.0.0', 8080), BackendAPI).serve_forever()
+                    EOF
+                    python /app/server.py
+                  readinessProbe:
+                    httpGet:
+                      path: /
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: backend-api
+            namespace: backend
+          spec:
+            type: NodePort
+            selector:
+              app: backend-api
+            ports:
+            - port: 8080
+              targetPort: 8080
+              nodePort: 30090
+
+    - name: Apply backend deployment
+      command: kubectl apply -f /tmp/backend-deployment.yaml
+
+    - name: Wait for backend pods to be ready
+      command: kubectl -n backend wait --for=condition=ready pod -l app=backend-api --timeout=120s
+      register: backend_ready
+      retries: 3
+      delay: 10
+      ignore_errors: yes
+
+#==============================================================================
+# PHASE 4: Deploy AWS Cluster - UI Pods
+#==============================================================================
+- name: Deploy UI Pods on AWS Cluster
+  hosts: aws-master
+  become: yes
+  vars:
+    os_gateway_ip: "{{ hostvars['vm-os-gateway']['ansible_host'] }}"
+    aws_gateway_ip: "{{ hostvars['vm-aws-gateway']['ansible_host'] }}"
+  tasks:
+    - name: Wait for K3s to be ready
+      command: kubectl get nodes
+      register: k3s_check
+      until: k3s_check.rc == 0
+      retries: 30
+      delay: 10
+
+    - name: Create UI namespace
+      shell: kubectl create namespace ui --dry-run=client -o yaml | kubectl apply -f -
+      args:
+        executable: /bin/bash
+
+    - name: Create UI ConfigMap with backend URL
+      copy:
+        dest: /tmp/ui-configmap.yaml
+        content: |
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: ui-config
+            namespace: ui
+          data:
+            BACKEND_URL: "http://{{ aws_gateway_ip }}:8080/api/backend"
+
+    - name: Apply UI ConfigMap
+      command: kubectl apply -f /tmp/ui-configmap.yaml
+
+    - name: Deploy UI Pods
+      copy:
+        dest: /tmp/ui-deployment.yaml
+        content: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: dashboard-ui
+            namespace: ui
+          spec:
+            replicas: 3
+            selector:
+              matchLabels:
+                app: dashboard-ui
+            template:
+              metadata:
+                labels:
+                  app: dashboard-ui
+              spec:
+                containers:
+                - name: nginx
+                  image: nginx:alpine
+                  ports:
+                  - containerPort: 80
+                  volumeMounts:
+                  - name: html
+                    mountPath: /usr/share/nginx/html
+                  - name: nginx-config
+                    mountPath: /etc/nginx/conf.d
+                initContainers:
+                - name: setup
+                  image: nginx:alpine
+                  imagePullPolicy: IfNotPresent
+                  command: ["/bin/sh", "-c"]
+                  args:
+                  - |
+                    cat > /html/index.html << 'HTMLEOF'
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>AWS Cluster Dashboard</title>
+                        <style>
+                            * { margin: 0; padding: 0; box-sizing: border-box; }
+                            body {
+                                font-family: 'Segoe UI', sans-serif;
+                                background: linear-gradient(135deg, #232f3e 0%, #1a252f 100%);
+                                min-height: 100vh;
+                                color: #fff;
+                            }
+                            .header {
+                                background: linear-gradient(90deg, #ff9900, #ffb84d);
+                                padding: 20px 40px;
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: center;
+                            }
+                            .header h1 { color: #232f3e; }
+                            .user-info { display: flex; align-items: center; gap: 15px; }
+                            .user-info span { color: #232f3e; font-weight: 600; }
+                            .btn { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-weight: 600; }
+                            .btn-logout { background: #232f3e; color: #ff9900; }
+                            .container { padding: 30px; max-width: 1400px; margin: 0 auto; }
+                            .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 30px; }
+                            .stat-card {
+                                background: linear-gradient(145deg, #2d3a4a, #1e2833);
+                                border-radius: 15px;
+                                padding: 25px;
+                                border-left: 4px solid #ff9900;
+                            }
+                            .stat-card h3 { color: #8899aa; font-size: 0.9em; margin-bottom: 10px; }
+                            .stat-card .value { font-size: 2.5em; font-weight: 700; color: #ff9900; }
+                            .section { background: linear-gradient(145deg, #2d3a4a, #1e2833); border-radius: 15px; padding: 25px; margin-bottom: 20px; }
+                            .section h2 { color: #ff9900; margin-bottom: 20px; }
+                            .pod-info { background: rgba(255,153,0,0.1); padding: 15px; border-radius: 10px; margin-bottom: 10px; }
+                            .loading { text-align: center; padding: 50px; }
+                            .spinner { width: 50px; height: 50px; border: 4px solid #2d3a4a; border-top: 4px solid #ff9900; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 20px; }
+                            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+                            .error { background: #e74c3c; padding: 20px; border-radius: 10px; text-align: center; }
+                            .success { background: #2ecc71; padding: 10px; border-radius: 5px; margin-top: 10px; }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="header">
+                            <h1>☁️ AWS Cluster Dashboard</h1>
+                            <div class="user-info">
+                                <span id="username">Loading...</span>
+                                <button class="btn btn-logout" onclick="logout()">Logout</button>
+                            </div>
+                        </div>
+                        <div class="container">
+                            <div id="loading" class="loading">
+                                <div class="spinner"></div>
+                                <p>Fetching data from OS Backend via mTLS...</p>
+                            </div>
+                            <div id="content" style="display:none;">
+                                <div class="stats-grid" id="stats"></div>
+                                <div class="section" id="backend-info"></div>
+                            </div>
+                            <div id="error" class="error" style="display:none;"></div>
+                        </div>
+                        <script>
+                            // Get token from URL or localStorage
+                            const urlParams = new URLSearchParams(window.location.search);
+                            let token = urlParams.get('token') || localStorage.getItem('jwt_token');
+                            
+                            if (token) {
+                                localStorage.setItem('jwt_token', token);
+                                // Clean URL
+                                if (urlParams.get('token')) {
+                                    window.history.replaceState({}, document.title, window.location.pathname);
+                                }
+                            }
+                            
+                            if (!token) {
+                                window.location.href = 'http://{{ hostvars["vm-auth-portal"]["ansible_host"] }}/';
+                            }
+                            
+                            function parseJwt(token) {
+                                try {
+                                    const base64 = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+                                    return JSON.parse(atob(base64));
+                                } catch { return {}; }
+                            }
+                            
+                            const payload = parseJwt(token);
+                            document.getElementById('username').textContent = '👤 ' + (payload.sub || 'User');
+                            
+                            async function fetchBackendData() {
+                                try {
+                                    // Fetch through AWS Gateway which uses mTLS to OS Gateway
+                                    const response = await fetch('/api/backend', {
+                                        headers: { 'Authorization': 'Bearer ' + token }
+                                    });
+                                    
+                                    if (response.status === 401 || response.status === 403) {
+                                        throw new Error('Access Denied - Invalid or expired token');
+                                    }
+                                    
+                                    const data = await response.json();
+                                    renderDashboard(data);
+                                } catch (err) {
+                                    document.getElementById('loading').style.display = 'none';
+                                    document.getElementById('error').style.display = 'block';
+                                    document.getElementById('error').innerHTML = '❌ ' + err.message;
+                                }
+                            }
+                            
+                            function renderDashboard(data) {
+                                document.getElementById('loading').style.display = 'none';
+                                document.getElementById('content').style.display = 'block';
+                                
+                                const d = data.data || {};
+                                document.getElementById('stats').innerHTML = `
+                                    <div class="stat-card">
+                                        <h3>TOTAL VMs</h3>
+                                        <div class="value">${d.total_vms || 0}</div>
+                                    </div>
+                                    <div class="stat-card">
+                                        <h3>RUNNING VMs</h3>
+                                        <div class="value">${d.running_vms || 0}</div>
+                                    </div>
+                                    <div class="stat-card">
+                                        <h3>NETWORKS</h3>
+                                        <div class="value">${d.networks || 0}</div>
+                                    </div>
+                                    <div class="stat-card">
+                                        <h3>STORAGE (TB)</h3>
+                                        <div class="value">${d.storage_tb || 0}</div>
+                                    </div>
+                                `;
+                                
+                                document.getElementById('backend-info').innerHTML = `
+                                    <h2>📡 Backend Response Info</h2>
+                                    <div class="pod-info">
+                                        <strong>Service:</strong> ${data.service}<br>
+                                        <strong>Pod:</strong> ${data.pod}<br>
+                                        <strong>Served via:</strong> mTLS (AWS Gateway ↔ OS Gateway)
+                                    </div>
+                                    <div class="success">✅ Successfully fetched data from OS Cluster Backend</div>
+                                `;
+                            }
+                            
+                            function logout() {
+                                localStorage.removeItem('jwt_token');
+                                window.location.href = 'http://{{ hostvars["vm-auth-portal"]["ansible_host"] }}/';
+                            }
+                            
+                            fetchBackendData();
+                        </script>
+                    </body>
+                    </html>
+                    HTMLEOF
+                    
+                    cat > /nginx-conf/default.conf << 'NGINXEOF'
+                    server {
+                        listen 80;
+                        location / {
+                            root /usr/share/nginx/html;
+                            index index.html;
+                        }
+                    }
+                    NGINXEOF
+                  volumeMounts:
+                  - name: html
+                    mountPath: /html
+                  - name: nginx-config
+                    mountPath: /nginx-conf
+                volumes:
+                - name: html
+                  emptyDir: {}
+                - name: nginx-config
+                  emptyDir: {}
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: dashboard-ui
+            namespace: ui
+          spec:
+            type: NodePort
+            selector:
+              app: dashboard-ui
+            ports:
+            - port: 80
+              targetPort: 80
+              nodePort: 30080
+
+    - name: Apply UI deployment
+      command: kubectl apply -f /tmp/ui-deployment.yaml
+
+    - name: Wait for UI pods to be ready
+      command: kubectl -n ui wait --for=condition=ready pod -l app=dashboard-ui --timeout=120s
+      register: ui_ready
+      retries: 3
+      delay: 10
+      ignore_errors: yes
+
+#==============================================================================
+# PHASE 5: Deploy OS Gateway - mTLS Envoy
+#==============================================================================
+- name: Deploy OS Gateway with mTLS
+  hosts: vm-os-gateway
+  become: yes
+  vars:
+    cert_dir: /tmp/zta-certs
+    os_cluster_ip: "{{ hostvars['os-master']['ansible_host'] }}"
+  tasks:
+    - name: Install Docker
+      apt:
+        name: [docker.io]
+        state: present
+        update_cache: yes
+
+    - name: Create certs directory
+      file:
+        path: /opt/certs
+        state: directory
+        mode: '0755'
+
+    - name: Copy certificates
+      copy:
+        src: "{{ cert_dir }}/{{ item }}"
+        dest: /opt/certs/{{ item }}
+        mode: '0644'
+      loop:
+        - ca-cert.pem
+        - os-gateway-key.pem
+        - os-gateway-cert.pem
+
+    - name: Create Envoy config for OS Gateway
+      copy:
+        dest: /opt/envoy-os.yaml
+        content: |
+          static_resources:
+            listeners:
+            - name: mtls_listener
+              address:
+                socket_address:
+                  address: 0.0.0.0
+                  port_value: 8443
+              filter_chains:
+              - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: ingress_https
+                    codec_type: AUTO
+                    route_config:
+                      name: backend_route
+                      virtual_hosts:
+                      - name: backend
+                        domains: ["*"]
+                        routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: os_backend
+                    http_filters:
+                    - name: envoy.filters.http.router
+                      typed_config:
+                        "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                transport_socket:
+                  name: envoy.transport_sockets.tls
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+                    require_client_certificate: true
+                    common_tls_context:
+                      tls_certificates:
+                      - certificate_chain:
+                          filename: /certs/os-gateway-cert.pem
+                        private_key:
+                          filename: /certs/os-gateway-key.pem
+                      validation_context:
+                        trusted_ca:
+                          filename: /certs/ca-cert.pem
+            
+            clusters:
+            - name: os_backend
+              connect_timeout: 5s
+              type: STRICT_DNS
+              lb_policy: ROUND_ROBIN
+              load_assignment:
+                cluster_name: os_backend
+                endpoints:
+                - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: {{ os_cluster_ip }}
+                          port_value: 30090
+          
+          admin:
+            address:
+              socket_address:
+                address: 0.0.0.0
+                port_value: 9901
+
+    - name: Run Envoy OS Gateway
+      shell: |
+        docker stop envoy-os 2>/dev/null || true
+        docker rm envoy-os 2>/dev/null || true
+        docker run -d --name envoy-os \
+          --network host \
+          -v /opt/envoy-os.yaml:/etc/envoy/envoy.yaml:ro \
+          -v /opt/certs:/certs:ro \
+          --restart always \
+          envoyproxy/envoy:v1.28-latest
+
+#==============================================================================
+# PHASE 6: Deploy AWS Gateway - OPA + Envoy with JWT Auth + mTLS Client
+#==============================================================================
+- name: Deploy AWS Gateway with OPA and mTLS
+  hosts: vm-aws-gateway
+  become: yes
+  vars:
+    cert_dir: /tmp/zta-certs
+    jwt_secret: "zta-hub-spoke-secret-key-2024"
+    os_gateway_ip: "{{ hostvars['vm-os-gateway']['ansible_host'] }}"
+    aws_cluster_ip: "{{ hostvars['aws-master']['ansible_host'] }}"
+    auth_portal_ip: "{{ hostvars['vm-auth-portal']['ansible_host'] }}"
+  tasks:
+    - name: Install Docker
+      apt:
+        name: [docker.io]
+        state: present
+        update_cache: yes
+
+    - name: Create directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /opt/certs
+        - /opt/opa
+
+    - name: Copy certificates
+      copy:
+        src: "{{ cert_dir }}/{{ item }}"
+        dest: /opt/certs/{{ item }}
+        mode: '0644'
+      loop:
+        - ca-cert.pem
+        - aws-gateway-key.pem
+        - aws-gateway-cert.pem
+
+    - name: Create OPA Policy
+      copy:
+        dest: /opt/policy.rego
+        content: |
+          package envoy.authz
+
+          import future.keywords.if
+          import future.keywords.in
+          import input.attributes.request.http as http_request
+
+          default allow = false
+
+          # Public endpoints
+          allow if {
+            http_request.path == "/"
+          }
+
+          allow if {
+            http_request.path in ["/health", "/ready", "/live"]
+          }
+
+          # Dashboard requires valid JWT
+          allow if {
+            http_request.path == "/dashboard"
+            is_valid_token
+          }
+
+          allow if {
+            startswith(http_request.path, "/dashboard")
+            is_valid_token
+          }
+
+          # API endpoints require valid JWT
+          allow if {
+            startswith(http_request.path, "/api/")
+            is_valid_token
+          }
+
+          # Check if JWT token is valid
+          is_valid_token if {
+            auth_header := http_request.headers.authorization
+            startswith(auth_header, "Bearer ")
+            token := substring(auth_header, 7, -1)
+            token != ""
+            parts := split(token, ".")
+            count(parts) == 3
+            payload_encoded := parts[1]
+            payload_padded := add_base64_padding(payload_encoded)
+            payload_decoded := base64.decode(payload_padded)
+            claims := json.unmarshal(payload_decoded)
+            claims.exp > time.now_ns() / 1000000000
+          }
+
+          # Add base64 padding
+          add_base64_padding(s) := padded if {
+            r := 4 - (count(s) % 4)
+            r < 4
+            padding := substring("====", 0, r)
+            s_fixed := replace(replace(s, "-", "+"), "_", "/")
+            padded := concat("", [s_fixed, padding])
+          }
+
+          add_base64_padding(s) := s_fixed if {
+            count(s) % 4 == 0
+            s_fixed := replace(replace(s, "-", "+"), "_", "/")
+          }
+
+    - name: Run OPA container
+      shell: |
+        docker stop opa 2>/dev/null || true
+        docker rm opa 2>/dev/null || true
+        docker run -d --name opa \
+          --network host \
+          -v /opt/policy.rego:/policy.rego:ro \
+          --restart always \
+          openpolicyagent/opa:latest-envoy \
+          run --server \
+          --addr=0.0.0.0:8181 \
+          --diagnostic-addr=0.0.0.0:8282 \
+          --set=plugins.envoy_ext_authz_grpc.addr=:9191 \
+          --set=plugins.envoy_ext_authz_grpc.path=envoy/authz/allow \
+          --set=decision_logs.console=true \
+          /policy.rego
+
+    - name: Create Envoy config for AWS Gateway
+      copy:
+        dest: /opt/envoy-aws.yaml
+        content: |
+          static_resources:
+            listeners:
+            - name: main_listener
+              address:
+                socket_address:
+                  address: 0.0.0.0
+                  port_value: 8080
+              filter_chains:
+              - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: ingress_http
+                    codec_type: AUTO
+                    route_config:
+                      name: local_route
+                      virtual_hosts:
+                      - name: backend
+                        domains: ["*"]
+                        routes:
+                        # Dashboard UI from AWS Cluster
+                        - match:
+                            prefix: "/dashboard"
+                          route:
+                            cluster: aws_ui
+                            prefix_rewrite: "/"
+                        - match:
+                            path: "/"
+                          route:
+                            cluster: aws_ui
+                        # Backend API via mTLS to OS Gateway
+                        - match:
+                            prefix: "/api/backend"
+                          route:
+                            cluster: os_gateway_mtls
+                            prefix_rewrite: "/"
+                        # Health check
+                        - match:
+                            path: "/health"
+                          direct_response:
+                            status: 200
+                            body:
+                              inline_string: '{"status":"healthy"}'
+                    http_filters:
+                    - name: envoy.filters.http.ext_authz
+                      typed_config:
+                        "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                        transport_api_version: V3
+                        grpc_service:
+                          envoy_grpc:
+                            cluster_name: opa
+                          timeout: 1s
+                        failure_mode_allow: false
+                    - name: envoy.filters.http.router
+                      typed_config:
+                        "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+            
+            clusters:
+            - name: opa
+              connect_timeout: 1s
+              type: STRICT_DNS
+              lb_policy: ROUND_ROBIN
+              typed_extension_protocol_options:
+                envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+                  "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+                  explicit_http_config:
+                    http2_protocol_options: {}
+              load_assignment:
+                cluster_name: opa
+                endpoints:
+                - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: 127.0.0.1
+                          port_value: 9191
+            
+            - name: aws_ui
+              connect_timeout: 5s
+              type: STRICT_DNS
+              lb_policy: ROUND_ROBIN
+              load_assignment:
+                cluster_name: aws_ui
+                endpoints:
+                - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: {{ aws_cluster_ip }}
+                          port_value: 30080
+            
+            - name: os_gateway_mtls
+              connect_timeout: 5s
+              type: STRICT_DNS
+              lb_policy: ROUND_ROBIN
+              load_assignment:
+                cluster_name: os_gateway_mtls
+                endpoints:
+                - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: {{ os_gateway_ip }}
+                          port_value: 8443
+              transport_socket:
+                name: envoy.transport_sockets.tls
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+                  common_tls_context:
+                    tls_certificates:
+                    - certificate_chain:
+                        filename: /certs/aws-gateway-cert.pem
+                      private_key:
+                        filename: /certs/aws-gateway-key.pem
+                    validation_context:
+                      trusted_ca:
+                        filename: /certs/ca-cert.pem
+          
+          admin:
+            address:
+              socket_address:
+                address: 0.0.0.0
+                port_value: 9901
+
+    - name: Run Envoy AWS Gateway
+      shell: |
+        docker stop envoy-aws 2>/dev/null || true
+        docker rm envoy-aws 2>/dev/null || true
+        docker run -d --name envoy-aws \
+          --network host \
+          -v /opt/envoy-aws.yaml:/etc/envoy/envoy.yaml:ro \
+          -v /opt/certs:/certs:ro \
+          --restart always \
+          envoyproxy/envoy:v1.28-latest
+
+    - name: Wait for services
+      pause:
+        seconds: 10
+
+    - name: Verify OPA is running
+      command: docker ps --filter name=opa --format "{{ '{{' }}.Status{{ '}}' }}"
+      register: opa_status
+
+    - name: Verify Envoy is running
+      command: docker ps --filter name=envoy-aws --format "{{ '{{' }}.Status{{ '}}' }}"
+      register: envoy_status
+
+    - name: Show status
+      debug:
+        msg: "OPA: {{ opa_status.stdout }}, Envoy: {{ envoy_status.stdout }}"

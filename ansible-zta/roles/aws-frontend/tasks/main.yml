@@ -1,0 +1,366 @@
+---
+# AWS Cluster Frontend UI
+# Receives JWT from Auth Portal, uses it to fetch data from OS cluster
+
+- name: Create AWS Cluster UI ConfigMap and Deployment
+  shell: |
+    cat <<'EOF' | kubectl apply -f -
+    apiVersion: v1
+    kind: ConfigMap
+    metadata: { name: frontend-html }
+    data:
+      index.html: |
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>AWS Cluster UI - Zero Trust Demo</title>
+          <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body {
+              font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+              background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+              min-height: 100vh;
+              padding: 20px;
+              color: #e2e8f0;
+            }
+            .header {
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              padding: 20px;
+              background: rgba(255, 255, 255, 0.05);
+              border-radius: 15px;
+              margin-bottom: 20px;
+            }
+            .logo { display: flex; align-items: center; gap: 15px; }
+            .logo h1 { font-size: 1.5rem; }
+            .logo span { 
+              background: linear-gradient(135deg, #f97316 0%, #fb923c 100%);
+              padding: 5px 12px;
+              border-radius: 20px;
+              font-size: 0.75rem;
+              font-weight: 600;
+            }
+            .auth-status {
+              display: flex;
+              align-items: center;
+              gap: 10px;
+            }
+            .status-dot {
+              width: 12px;
+              height: 12px;
+              border-radius: 50%;
+            }
+            .status-dot.auth { background: #10b981; }
+            .status-dot.unauth { background: #ef4444; }
+            .container {
+              display: grid;
+              grid-template-columns: 1fr 1fr;
+              gap: 20px;
+            }
+            @media (max-width: 900px) {
+              .container { grid-template-columns: 1fr; }
+            }
+            .card {
+              background: rgba(255, 255, 255, 0.05);
+              border-radius: 15px;
+              padding: 25px;
+              border: 1px solid rgba(255, 255, 255, 0.1);
+            }
+            .card h2 {
+              color: #f97316;
+              margin-bottom: 15px;
+              font-size: 1.2rem;
+            }
+            .flow-box {
+              background: rgba(0, 0, 0, 0.3);
+              padding: 20px;
+              border-radius: 10px;
+              font-family: monospace;
+              font-size: 0.85rem;
+              line-height: 2;
+            }
+            .flow-arrow { color: #f97316; }
+            button {
+              padding: 12px 24px;
+              border: none;
+              border-radius: 8px;
+              font-size: 0.95rem;
+              font-weight: 600;
+              cursor: pointer;
+              transition: all 0.3s;
+              margin: 5px;
+            }
+            .btn-primary {
+              background: linear-gradient(135deg, #f97316 0%, #fb923c 100%);
+              color: white;
+            }
+            .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 4px 15px rgba(249, 115, 22, 0.4); }
+            .btn-secondary {
+              background: rgba(255, 255, 255, 0.1);
+              color: #e2e8f0;
+              border: 1px solid rgba(255, 255, 255, 0.2);
+            }
+            .btn-secondary:hover { background: rgba(255, 255, 255, 0.15); }
+            .btn-login {
+              background: linear-gradient(135deg, #7c3aed 0%, #a855f7 100%);
+              color: white;
+            }
+            .result-box {
+              margin-top: 20px;
+              padding: 20px;
+              border-radius: 10px;
+              background: rgba(0, 0, 0, 0.3);
+              max-height: 400px;
+              overflow-y: auto;
+            }
+            .result-box.success { border-left: 4px solid #10b981; }
+            .result-box.error { border-left: 4px solid #ef4444; }
+            .result-box.info { border-left: 4px solid #3b82f6; }
+            pre {
+              font-size: 0.85rem;
+              white-space: pre-wrap;
+              word-break: break-all;
+            }
+            .token-info {
+              background: rgba(124, 58, 237, 0.2);
+              padding: 15px;
+              border-radius: 10px;
+              margin-bottom: 15px;
+              font-size: 0.85rem;
+            }
+            .token-info strong { color: #a855f7; }
+            .security-layers {
+              display: flex;
+              flex-wrap: wrap;
+              gap: 10px;
+              margin-top: 15px;
+            }
+            .layer-badge {
+              background: rgba(16, 185, 129, 0.2);
+              color: #10b981;
+              padding: 5px 12px;
+              border-radius: 20px;
+              font-size: 0.75rem;
+              border: 1px solid rgba(16, 185, 129, 0.3);
+            }
+            .links { margin-top: 20px; }
+            .links a {
+              color: #60a5fa;
+              text-decoration: none;
+              margin-right: 15px;
+            }
+            .links a:hover { text-decoration: underline; }
+          </style>
+        </head>
+        <body>
+          <div class="header">
+            <div class="logo">
+              <h1>☁️ AWS Cluster UI</h1>
+              <span>FRONTEND</span>
+            </div>
+            <div class="auth-status">
+              <span class="status-dot" id="statusDot"></span>
+              <span id="authLabel">Checking...</span>
+            </div>
+          </div>
+          
+          <div class="container">
+            <div class="card">
+              <h2>🔄 Request Flow</h2>
+              <div class="flow-box">
+                <div>1️⃣ Auth Portal <span class="flow-arrow">→</span> Keycloak</div>
+                <div>2️⃣ Keycloak <span class="flow-arrow">→</span> JWT Token</div>
+                <div>3️⃣ User + JWT <span class="flow-arrow">→</span> AWS Cluster UI</div>
+                <div>4️⃣ AWS Envoy <span class="flow-arrow">→</span> JWT Validation</div>
+                <div>5️⃣ WireGuard mTLS <span class="flow-arrow">→</span> OS Gateway</div>
+                <div>6️⃣ OS Gateway <span class="flow-arrow">→</span> Backend Data</div>
+              </div>
+              
+              <div id="tokenInfo" class="token-info" style="display:none;">
+                <strong>Current JWT Info:</strong>
+                <div id="jwtDetails"></div>
+              </div>
+              
+              <div class="links">
+                <a href="http://{{ auth_portal_public_ip }}:8888" target="_blank">🔐 Auth Portal</a>
+                <p style="color: #94a3b8; font-size: 12px;">📊 Grafana: Use SSH tunnel (localhost:3000)</p>
+              </div>
+            </div>
+            
+            <div class="card">
+              <h2>📡 Data Operations</h2>
+              
+              <div id="noAuthSection">
+                <p style="color: #94a3b8; margin-bottom: 15px;">
+                  You need to authenticate first. Get a JWT from the Auth Portal.
+                </p>
+                <button class="btn-login" onclick="goToAuthPortal()">🔐 Go to Auth Portal</button>
+                <button class="btn-secondary" onclick="pasteToken()">📋 Paste JWT Token</button>
+              </div>
+              
+              <div id="authSection" style="display:none;">
+                <button class="btn-primary" onclick="fetchSecureData()">📥 Fetch OS Cluster Data</button>
+                <button class="btn-secondary" onclick="fetchHealth()">❤️ Health Check</button>
+                <button class="btn-secondary" onclick="clearToken()">🚪 Clear Token</button>
+              </div>
+              
+              <div id="resultBox" class="result-box info">
+                <p>Click a button above to make API requests through the Zero Trust pipeline.</p>
+              </div>
+              
+              <div class="security-layers">
+                <span class="layer-badge">JWT Auth</span>
+                <span class="layer-badge">Envoy Proxy</span>
+                <span class="layer-badge">OPA Policy</span>
+                <span class="layer-badge">mTLS Tunnel</span>
+                <span class="layer-badge">OS Gateway</span>
+              </div>
+            </div>
+          </div>
+          
+          <script>
+            const AUTH_PORTAL = 'http://{{ auth_portal_public_ip }}:8888';
+            
+            // Check auth status on load
+            checkAuthStatus();
+            
+            function checkAuthStatus() {
+              const token = localStorage.getItem('zta_jwt');
+              const statusDot = document.getElementById('statusDot');
+              const authLabel = document.getElementById('authLabel');
+              const noAuthSection = document.getElementById('noAuthSection');
+              const authSection = document.getElementById('authSection');
+              const tokenInfo = document.getElementById('tokenInfo');
+              
+              if (token && isTokenValid(token)) {
+                statusDot.className = 'status-dot auth';
+                authLabel.textContent = 'Authenticated';
+                noAuthSection.style.display = 'none';
+                authSection.style.display = 'block';
+                tokenInfo.style.display = 'block';
+                
+                // Show JWT details
+                try {
+                  const payload = JSON.parse(atob(token.split('.')[1]));
+                  const exp = new Date(payload.exp * 1000);
+                  document.getElementById('jwtDetails').innerHTML = 
+                    'User: ' + (payload.preferred_username || payload.sub) + '<br>' +
+                    'Expires: ' + exp.toLocaleTimeString();
+                } catch (e) {}
+              } else {
+                statusDot.className = 'status-dot unauth';
+                authLabel.textContent = 'Not Authenticated';
+                noAuthSection.style.display = 'block';
+                authSection.style.display = 'none';
+                tokenInfo.style.display = 'none';
+              }
+            }
+            
+            function isTokenValid(token) {
+              try {
+                const payload = JSON.parse(atob(token.split('.')[1]));
+                return payload.exp * 1000 > Date.now();
+              } catch (e) {
+                return false;
+              }
+            }
+            
+            function goToAuthPortal() {
+              window.open(AUTH_PORTAL, '_blank');
+            }
+            
+            function pasteToken() {
+              const token = prompt('Paste your JWT token from Auth Portal:');
+              if (token && token.length > 20) {
+                localStorage.setItem('zta_jwt', token);
+                checkAuthStatus();
+                showResult('info', '✅ Token saved! You can now fetch data.');
+              }
+            }
+            
+            function clearToken() {
+              localStorage.removeItem('zta_jwt');
+              checkAuthStatus();
+              showResult('info', '👋 Token cleared. Please re-authenticate.');
+            }
+            
+            async function fetchSecureData() {
+              const token = localStorage.getItem('zta_jwt');
+              if (!token) {
+                showResult('error', '❌ No JWT token. Please authenticate first.');
+                return;
+              }
+              
+              showResult('info', '🔄 Fetching data from OS Cluster via Zero Trust pipeline...');
+              
+              try {
+                const res = await fetch('/api/secure-data', {
+                  headers: { 'Authorization': 'Bearer ' + token }
+                });
+                
+                if (res.ok) {
+                  const data = await res.json();
+                  showResult('success', '✅ Data received from OS Cluster:\n\n' + JSON.stringify(data, null, 2));
+                } else if (res.status === 401) {
+                  showResult('error', '❌ Unauthorized (401): Token expired or invalid.\nPlease re-authenticate.');
+                  localStorage.removeItem('zta_jwt');
+                  checkAuthStatus();
+                } else if (res.status === 403) {
+                  showResult('error', '❌ Forbidden (403): OPA policy denied the request.');
+                } else {
+                  showResult('error', '❌ Error: HTTP ' + res.status);
+                }
+              } catch (err) {
+                showResult('error', '❌ Network error: ' + err.message);
+              }
+            }
+            
+            async function fetchHealth() {
+              showResult('info', '🔄 Checking health...');
+              try {
+                const res = await fetch('/health');
+                showResult('success', '✅ AWS Gateway is healthy\nStatus: ' + res.status);
+              } catch (err) {
+                showResult('error', '❌ Health check failed: ' + err.message);
+              }
+            }
+            
+            function showResult(type, message) {
+              const box = document.getElementById('resultBox');
+              box.className = 'result-box ' + type;
+              box.innerHTML = '<pre>' + message + '</pre>';
+            }
+            
+            // Auto-refresh token status
+            setInterval(checkAuthStatus, 10000);
+          </script>
+        </body>
+        </html>
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: { name: frontend }
+    spec:
+      replicas: 1
+      selector: { matchLabels: { app: frontend } }
+      template:
+        metadata: { labels: { app: frontend } }
+        spec:
+          containers:
+          - name: nginx
+            image: nginx:alpine
+            ports: [{ containerPort: 80 }]
+            volumeMounts: [{ name: html, mountPath: /usr/share/nginx/html }]
+          volumes: [{ name: html, configMap: { name: frontend-html } }]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: { name: frontend-svc }
+    spec:
+      type: NodePort
+      selector: { app: frontend }
+      ports: [{ port: 80, targetPort: 80, nodePort: 30090 }]
+    EOF

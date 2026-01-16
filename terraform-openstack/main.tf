@@ -62,21 +62,7 @@ data "openstack_networking_network_v2" "external" {
 
 #################### NETWORKS & SUBNETS ####################
 
-# --- Zone 1: Management ---
-resource "openstack_networking_network_v2" "management" {
-  name           = "net-management"
-  admin_state_up = true
-}
-
-resource "openstack_networking_subnet_v2" "management" {
-  name            = "subnet-management"
-  network_id      = openstack_networking_network_v2.management.id
-  cidr            = "10.30.1.0/24"
-  ip_version      = 4
-  dns_nameservers = ["8.8.8.8", "8.8.4.4"]
-}
-
-# --- Zone 2: Observability ---
+# --- Zone 1: Observability (Monitoring + Identity) ---
 resource "openstack_networking_network_v2" "observability" {
   name           = "net-observability"
   admin_state_up = true
@@ -118,37 +104,63 @@ resource "openstack_networking_subnet_v2" "cloud_aws" {
   dns_nameservers = ["8.8.8.8", "8.8.4.4"]
 }
 
-#################### ROUTERS ####################
+# --- Zone 5: DMZ (Auth Portal - Single Entry Point) ---
+# This network is ISOLATED from AWS and OS clusters
+# Auth Portal can only reach Keycloak, not direct to OS Cluster
+resource "openstack_networking_network_v2" "dmz" {
+  name           = "net-dmz"
+  admin_state_up = true
+}
 
-resource "openstack_networking_router_v2" "aws" {
-  name                = "router-aws"
+resource "openstack_networking_subnet_v2" "dmz" {
+  name            = "subnet-dmz"
+  network_id      = openstack_networking_network_v2.dmz.id
+  cidr            = "10.50.1.0/24"
+  ip_version      = 4
+  dns_nameservers = ["8.8.8.8", "8.8.4.4"]
+}
+
+#################### ROUTERS ####################
+# Hub-and-Spoke Zero Trust Architecture
+# - Hub: router-dmz (single exit point to internet)
+# - Spokes: AWS, OS networks connected to Hub
+# - SNAT disabled: internal VMs cannot access internet directly
+
+# Observability Router - For monitoring and identity VMs (needs internet for docker pulls)
+resource "openstack_networking_router_v2" "observability" {
+  name                = "router-observability"
   external_network_id = data.openstack_networking_network_v2.external.id
 }
+resource "openstack_networking_router_interface_v2" "observability" {
+  router_id = openstack_networking_router_v2.observability.id
+  subnet_id = openstack_networking_subnet_v2.observability.id
+}
+
+# DMZ Router (HUB) - Single entry/exit point
+# Connects: DMZ, AWS, OS networks
+# SNAT disabled - only Auth Portal has floating IP for internet access
+resource "openstack_networking_router_v2" "dmz" {
+  name                = "router-dmz"
+  external_network_id = data.openstack_networking_network_v2.external.id
+  enable_snat         = false
+}
+
+# Hub interfaces
+resource "openstack_networking_router_interface_v2" "dmz" {
+  router_id = openstack_networking_router_v2.dmz.id
+  subnet_id = openstack_networking_subnet_v2.dmz.id
+}
+
+# Spoke: AWS Network -> Hub
 resource "openstack_networking_router_interface_v2" "cloud_aws" {
-  router_id = openstack_networking_router_v2.aws.id
+  router_id = openstack_networking_router_v2.dmz.id
   subnet_id = openstack_networking_subnet_v2.cloud_aws.id
 }
 
-resource "openstack_networking_router_v2" "os" {
-  name                = "router-os"
-  external_network_id = data.openstack_networking_network_v2.external.id
-}
+# Spoke: OS Network -> Hub  
 resource "openstack_networking_router_interface_v2" "cloud_os" {
-  router_id = openstack_networking_router_v2.os.id
+  router_id = openstack_networking_router_v2.dmz.id
   subnet_id = openstack_networking_subnet_v2.cloud_os.id
-}
-
-resource "openstack_networking_router_v2" "mgmt" {
-  name                = "router-mgmt"
-  external_network_id = data.openstack_networking_network_v2.external.id
-}
-resource "openstack_networking_router_interface_v2" "management" {
-  router_id = openstack_networking_router_v2.mgmt.id
-  subnet_id = openstack_networking_subnet_v2.management.id
-}
-resource "openstack_networking_router_interface_v2" "observability" {
-  router_id = openstack_networking_router_v2.mgmt.id
-  subnet_id = openstack_networking_subnet_v2.observability.id
 }
 
 #################### SECURITY GROUP ####################
@@ -268,17 +280,93 @@ resource "openstack_networking_secgroup_rule_v2" "wireguard_udp" {
   security_group_id = openstack_networking_secgroup_v2.default.id
 }
 
+#################### DMZ SECURITY GROUP ####################
+# Restricted security group for Auth Portal
+# Only allows: SSH, HTTP (Auth Portal UI), and outbound to Keycloak
+# NO direct access to OS Cluster (10.10.2.0/24)
+
+resource "openstack_networking_secgroup_v2" "dmz" {
+  name        = "sg-dmz"
+  description = "Security group for DMZ Auth Portal - Isolated from clusters"
+}
+
+# SSH access for management
+resource "openstack_networking_secgroup_rule_v2" "dmz_ssh" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 22
+  port_range_max    = 22
+  remote_ip_prefix  = "0.0.0.0/0"
+  security_group_id = openstack_networking_secgroup_v2.dmz.id
+}
+
+# HTTP for Auth Portal UI
+resource "openstack_networking_secgroup_rule_v2" "dmz_http" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 80
+  port_range_max    = 80
+  remote_ip_prefix  = "0.0.0.0/0"
+  security_group_id = openstack_networking_secgroup_v2.dmz.id
+}
+
+# HTTPS for Auth Portal
+resource "openstack_networking_secgroup_rule_v2" "dmz_https" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 443
+  port_range_max    = 443
+  remote_ip_prefix  = "0.0.0.0/0"
+  security_group_id = openstack_networking_secgroup_v2.dmz.id
+}
+
+# Auth Portal App Port (8888)
+resource "openstack_networking_secgroup_rule_v2" "dmz_auth_portal" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 8888
+  port_range_max    = 8888
+  remote_ip_prefix  = "0.0.0.0/0"
+  security_group_id = openstack_networking_secgroup_v2.dmz.id
+}
+
+# Allow outbound to Keycloak (via Monitoring proxy - 10.40.1.0/24)
+resource "openstack_networking_secgroup_rule_v2" "dmz_to_keycloak" {
+  direction         = "egress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 8080
+  port_range_max    = 8080
+  remote_ip_prefix  = "10.40.1.0/24"
+  security_group_id = openstack_networking_secgroup_v2.dmz.id
+}
+
+# ICMP for debugging
+resource "openstack_networking_secgroup_rule_v2" "dmz_icmp" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "icmp"
+  security_group_id = openstack_networking_secgroup_v2.dmz.id
+}
+
+# Note: Default egress rules are automatically created by OpenStack
+# No need to explicitly define egress_all rule
+
+# BLOCK: NO rules allowing DMZ to reach OS Cluster (10.10.2.0/24)
+# BLOCK: NO rules allowing DMZ to reach AWS internal (10.20.2.0/24)
+# This ensures Auth Portal cannot directly access backend clusters
+
 #################### FLOATING IPS ####################
+# Hub-and-Spoke Zero Trust: ONLY Auth Portal has floating IP
+# All other services accessed through Auth Portal proxy
+# Monitoring (Grafana/Jaeger) - NO public IP, access via Auth Portal
 
-resource "openstack_networking_floatingip_v2" "aws_gateway" {
-  pool = var.external_network_name
-}
-
-resource "openstack_networking_floatingip_v2" "os_gateway" {
-  pool = var.external_network_name
-}
-
-resource "openstack_networking_floatingip_v2" "monitoring" {
+# Floating IP for Auth Portal (DMZ) - THE ONLY public entry point
+resource "openstack_networking_floatingip_v2" "auth_portal" {
   pool = var.external_network_name
 }
 
@@ -318,6 +406,18 @@ resource "openstack_networking_port_v2" "port_monitoring" {
   }
 }
 
+# Port for Auth Portal in DMZ
+resource "openstack_networking_port_v2" "port_auth_portal" {
+  name           = "port-auth-portal"
+  network_id     = openstack_networking_network_v2.dmz.id
+  admin_state_up = true
+  security_group_ids = [openstack_networking_secgroup_v2.dmz.id]
+  fixed_ip {
+    subnet_id  = openstack_networking_subnet_v2.dmz.id
+    ip_address = "10.50.1.10"
+  }
+}
+
 #################### INSTANCES ####################
 
 # 1. AWS Gateway (Uses Pre-created Port, Flavor Nano)
@@ -332,11 +432,8 @@ resource "openstack_compute_instance_v2" "aws_gateway" {
   }
 }
 
-# Associate Floating IP to Port (Not Instance) -> More Reliable
-resource "openstack_networking_floatingip_associate_v2" "aws_gateway" {
-  floating_ip = openstack_networking_floatingip_v2.aws_gateway.address
-  port_id     = openstack_networking_port_v2.port_aws_gateway.id
-}
+# No Floating IP for AWS Gateway - Hub-and-Spoke model
+# Access via Auth Portal only
 
 # 2. OS Gateway (Uses Pre-created Port, Flavor Nano)
 resource "openstack_compute_instance_v2" "os_gateway" {
@@ -350,12 +447,11 @@ resource "openstack_compute_instance_v2" "os_gateway" {
   }
 }
 
-resource "openstack_networking_floatingip_associate_v2" "os_gateway" {
-  floating_ip = openstack_networking_floatingip_v2.os_gateway.address
-  port_id     = openstack_networking_port_v2.port_os_gateway.id
-}
+# No Floating IP for OS Gateway - Hub-and-Spoke model
+# Access via Auth Portal only
 
 # 3. Monitoring VM (Uses Pre-created Port, Flavor Nano-Plus for DISK)
+# NO Floating IP - Zero Trust: Access via Auth Portal proxy only
 resource "openstack_compute_instance_v2" "monitoring" {
   name            = "vm-monitoring"
   image_id        = data.openstack_images_image_v2.ubuntu.id
@@ -367,12 +463,27 @@ resource "openstack_compute_instance_v2" "monitoring" {
   }
 }
 
-resource "openstack_networking_floatingip_associate_v2" "monitoring" {
-  floating_ip = openstack_networking_floatingip_v2.monitoring.address
-  port_id     = openstack_networking_port_v2.port_monitoring.id
+# REMOVED: floating IP for monitoring - Zero Trust compliance
+# Monitoring only accessible via Auth Portal reverse proxy
+
+# 4. Auth Portal VM (DMZ - Isolated Network)
+resource "openstack_compute_instance_v2" "auth_portal" {
+  name            = "vm-auth-portal"
+  image_id        = data.openstack_images_image_v2.ubuntu.id
+  flavor_name     = "zta-flavor"  # 1024MB RAM - lighter than zta-optimal
+  key_pair        = var.keypair_name
+
+  network {
+    port = openstack_networking_port_v2.port_auth_portal.id
+  }
 }
 
-# 4. Identity VM (Flavor Nano-Plus for DISK)
+resource "openstack_networking_floatingip_associate_v2" "auth_portal" {
+  floating_ip = openstack_networking_floatingip_v2.auth_portal.address
+  port_id     = openstack_networking_port_v2.port_auth_portal.id
+}
+
+# 5. Identity VM (Keycloak + SPIRE Server) - Same subnet as monitoring for hub routing
 resource "openstack_compute_instance_v2" "identity" {
   name            = "vm-identity"
   image_id        = data.openstack_images_image_v2.ubuntu.id
@@ -381,13 +492,13 @@ resource "openstack_compute_instance_v2" "identity" {
   security_groups = ["sg-zta"]
 
   network {
-    uuid        = openstack_networking_network_v2.management.id
-    fixed_ip_v4 = "10.30.1.20"
+    uuid        = openstack_networking_network_v2.observability.id
+    fixed_ip_v4 = "10.40.1.20"
   }
-  depends_on = [openstack_networking_subnet_v2.management]
+  depends_on = [openstack_networking_subnet_v2.observability]
 }
 
-# 5. AWS Master (Flavor Nano-Plus for DISK)
+# 6. AWS Master (Flavor Nano-Plus for DISK)
 resource "openstack_compute_instance_v2" "aws_master" {
   name            = "aws-master"
   image_id        = data.openstack_images_image_v2.ubuntu.id
@@ -402,7 +513,7 @@ resource "openstack_compute_instance_v2" "aws_master" {
   depends_on = [openstack_networking_subnet_v2.cloud_aws]
 }
 
-# 6. OS Master (Flavor Nano-Plus for DISK)
+# 7. OS Master (Flavor Nano-Plus for DISK)
 resource "openstack_compute_instance_v2" "os_master" {
   name            = "os-master"
   image_id        = data.openstack_images_image_v2.ubuntu.id
@@ -419,14 +530,25 @@ resource "openstack_compute_instance_v2" "os_master" {
 
 #################### OUTPUTS ####################
 
-output "aws_gateway_ip" {
-  value = openstack_networking_floatingip_v2.aws_gateway.address
+# Zero Trust: Only Auth Portal has public access
+output "auth_portal_ip" {
+  value       = openstack_networking_floatingip_v2.auth_portal.address
+  description = "Auth Portal (Single Entry Point) - THE ONLY public entry point"
 }
 
-output "os_gateway_ip" {
-  value = openstack_networking_floatingip_v2.os_gateway.address
+# Monitoring - Internal only, access via Auth Portal proxy
+output "monitoring_internal_ip" {
+  value       = "10.40.1.10"
+  description = "Monitoring (Grafana/Jaeger) - NO public IP, access via Auth Portal /grafana/"
 }
 
-output "monitoring_ip" {
-  value = openstack_networking_floatingip_v2.monitoring.address
+# Internal IPs (no public access)
+output "aws_gateway_internal_ip" {
+  value       = "10.20.2.5"
+  description = "AWS Gateway - internal only, access via Auth Portal"
+}
+
+output "os_gateway_internal_ip" {
+  value       = "10.10.2.5"
+  description = "OS Gateway - internal only, access via Auth Portal"
 }

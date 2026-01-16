@@ -1,160 +1,179 @@
-# Zero Trust Architecture - Technical Documentation
+# ZTA Hub-and-Spoke Architecture
 
-## System Architecture Diagram
+## Overview
+
+Zero Trust Architecture with Hub-and-Spoke network topology for multi-cloud environments.
+
+## Network Topology
 
 ```
-┌────────────────────────────────────────────────────────────────────────────────────────────┐
-│                       ZERO TRUST MULTI-CLOUD ARCHITECTURE                                   │
-│                          (Single Entry Point Design)                                        │
-├────────────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                             │
-│                                    ┌─────────────┐                                         │
-│                                    │  INTERNET   │                                         │
-│                                    │   (Users)   │                                         │
-│                                    └──────┬──────┘                                         │
-│                                           │                                                │
-│                                           │ ALL external traffic                           │
-│                                           │ enters through ONE point                       │
-│                                           ▼                                                │
-│  ╔═════════════════════════════════════════════════════════════════════════════════════╗  │
-│  ║            AWS GATEWAY - SINGLE PUBLIC ENTRY POINT (172.10.10.181)                  ║  │
-│  ╠═════════════════════════════════════════════════════════════════════════════════════╣  │
-│  ║                                                                                      ║  │
-│  ║    ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐  ║  │
-│  ║    │    ENVOY     │────►│   KEYCLOAK   │────►│     OPA      │────►│   WIREGUARD  │  ║  │
-│  ║    │   PROXY      │     │   (via       │     │   POLICY     │     │   TUNNEL     │  ║  │
-│  ║    │   :80/:8080  │     │   tunnel)    │     │   :8181      │     │   :51820     │  ║  │
-│  ║    │              │     │              │     │              │     │              │  ║  │
-│  ║    │ • TLS Term   │     │ • JWT Issue  │     │ • Rego Rules │     │ • mTLS       │  ║  │
-│  ║    │ • Routing    │     │ • AuthN      │     │ • Real-time  │     │ • Encryption │  ║  │
-│  ║    │ • JWT Valid  │     │ • Token Mgmt │     │ • Audit Log  │     │ • Isolation  │  ║  │
-│  ║    └──────────────┘     └──────────────┘     └──────────────┘     └───────┬──────┘  ║  │
-│  ║                                                                            │         ║  │
-│  ╚════════════════════════════════════════════════════════════════════════════╪═════════╝  │
-│                                                                                │            │
-│  ════════════════════════════════ INTERNAL NETWORK ════════════════════════════            │
-│                              (No Direct Internet Access)                       │            │
-│                                                                                │            │
-│    ┌───────────────────────┐    ┌────────────────────────┐    ┌────────────────┴──────┐   │
-│    │                       │    │                        │    │                       │   │
-│    │    AWS CLOUD VPC      │    │   MANAGEMENT VPC       │    │   OPENSTACK CLOUD VPC │   │
-│    │    10.20.2.0/24       │    │   10.30.1.0/24         │    │   10.10.2.0/24        │   │
-│    │                       │    │                        │    │                       │   │
-│    │  ┌─────────────────┐  │    │  ┌──────────────────┐  │    │  ┌─────────────────┐  │   │
-│    │  │   K3s CLUSTER   │  │    │  │    KEYCLOAK      │  │    │  │   OS GATEWAY    │  │   │
-│    │  │   (Frontend)    │  │    │  │    (Identity)    │  │    │  │   (mTLS :443)   │  │   │
-│    │  │                 │  │    │  │    :8080         │  │    │  │                 │  │   │
-│    │  │  ┌───────────┐  │  │    │  └──────────────────┘  │    │  │  ┌───────────┐  │  │   │
-│    │  │  │  nginx    │  │  │    │  ┌──────────────────┐  │    │  │  │  Envoy    │  │  │   │
-│    │  │  │  :30090   │  │  │    │  │   SPIRE SERVER   │  │    │  │  │  +mTLS    │  │  │   │
-│    │  │  └───────────┘  │  │    │  │   :8081          │  │    │  │  └─────┬─────┘  │  │   │
-│    │  │                 │  │    │  └──────────────────┘  │    │  │        │        │  │   │
-│    │  └─────────────────┘  │    │  ┌──────────────────┐  │    │  │  ┌─────▼─────┐  │  │   │
-│    │                       │    │  │   MONITORING     │  │    │  │  │  K3s      │  │  │   │
-│    │                       │    │  │   • Prometheus   │  │    │  │  │  Backend  │  │  │   │
-│    │                       │    │  │   • Grafana      │  │    │  │  │  :30091   │  │  │   │
-│    │                       │    │  │   • Loki         │  │    │  │  │  (Flask)  │  │  │   │
-│    │                       │    │  │   • Jaeger       │  │    │  │  └───────────┘  │  │   │
-│    │                       │    │  └──────────────────┘  │    │  │                 │  │   │
-│    └───────────────────────┘    └────────────────────────┘    │  └─────────────────┘  │   │
-│                                                                │                       │   │
-│                                                                └───────────────────────┘   │
-│                                                                                             │
-├────────────────────────────────────────────────────────────────────────────────────────────┤
-│                                     REQUEST FLOW                                            │
-│  ┌──────┐    ┌────────────┐    ┌────────┐    ┌─────┐    ┌────────────┐    ┌─────────────┐ │
-│  │ User │───►│ AWS Envoy  │───►│Keycloak│───►│ OPA │───►│ WireGuard  │───►│ OS Gateway  │ │
-│  │      │    │ (JWT+Route)│    │ (AuthN)│    │(Authz)   │  (mTLS)    │    │ → Backend   │ │
-│  └──────┘    └────────────┘    └────────┘    └─────┘    └────────────┘    └─────────────┘ │
-│                                                                                             │
-└────────────────────────────────────────────────────────────────────────────────────────────┘
+                              INTERNET
+                                 │
+           ┌─────────────────────┼─────────────────────┐
+           │                     │                     │
+    ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+    │     DMZ      │      │ Observability│      │   (hidden)   │
+    │ 10.50.1.0/24 │      │ 10.40.1.0/24 │      │              │
+    │              │      │              │      │              │
+    │ Auth Portal  │      │ Monitoring   │      │              │
+    │172.10.10.170 │      │ 10.40.1.10   │      │              │
+    │ (ONLY PUBLIC)│      │ (NO PUB IP)  │      │              │
+    │              │      │              │      │              │
+    │ WireGuard Hub│      │ Identity     │      │              │
+    │ 10.99.0.100  │      │ 10.40.1.20   │      │              │
+    └──────────────┘      │ SPIRE Server │      │              │
+           │              └──────────────┘      └──────────────┘
+           │
+           │         router-dmz (HUB)
+           │
+    ┌──────┴───────────────────────┐
+    │                              │
+    │    WireGuard VPN Tunnel      │
+    │        10.99.0.0/24          │
+    │                              │
+    └──────┬───────────────┬───────┘
+           │               │
+    ┌──────┴─────┐  ┌──────┴─────┐
+    │            │  │            │
+    ▼            │  │            ▼
+┌────────────────┴──┴────────────────┐
+│                                    │
+│  ┌────────────────────────────┐    │
+│  │   AWS Network              │    │
+│  │   10.20.2.0/24             │    │
+│  │                            │    │
+│  │   AWS Gateway: 10.20.2.5   │    │
+│  │   WireGuard: 10.99.0.1     │    │
+│  │   - Envoy (:8080)          │    │
+│  │   - OPA (:9191)            │    │
+│  │   - SPIRE Agent            │    │
+│  │                            │    │
+│  │   AWS Cluster: 10.20.2.10  │    │
+│  │   - K3s (UI Pods)          │    │
+│  └────────────────────────────┘    │
+│                                    │
+│  ┌────────────────────────────┐    │
+│  │   OS Network               │    │
+│  │   10.10.2.0/24             │    │
+│  │                            │    │
+│  │   OS Gateway: 10.10.2.5    │    │
+│  │   WireGuard: 10.99.0.2     │    │
+│  │   - Envoy mTLS (:443)      │    │
+│  │   - SPIRE Agent            │    │
+│  │                            │    │
+│  │   OS Cluster: 10.10.2.10   │    │
+│  │   - K3s (Backend Pods)     │    │
+│  └────────────────────────────┘    │
+│                                    │
+└────────────────────────────────────┘
 ```
 
-## Request Flow
+## Components
+
+### Auth Portal (172.10.10.170)
+- **Login UI**: Port 80 - Static HTML login page
+- **JWT Server**: Port 8888 - Issues HS256 signed tokens (15-minute expiry)
+- **WireGuard Hub**: 10.99.0.100 - Central tunnel endpoint
+- Redirects authenticated users to AWS Gateway
+
+### Identity Server (10.40.1.20)
+- **SPIRE Server**: Port 8081
+- Trust domain: `zta.local`
+- Issues X.509 SVIDs with 5-minute TTL
+- Auto-rotation of workload certificates
+
+### AWS Gateway (10.20.2.5)
+- **OPA**: Port 9191 (gRPC), 8181 (HTTP)
+- **Envoy**: Port 8080 - JWT validation + routing
+- **SPIRE Agent**: Fetches SVID for mTLS client
+- **WireGuard Spoke**: 10.99.0.1
+- Workload ID: `spiffe://zta.local/workload/aws-service`
+
+### OS Gateway (10.10.2.5)
+- **Envoy mTLS**: Port 443 - Terminates mTLS from AWS
+- **SPIRE Agent**: Fetches SVID for mTLS server
+- **WireGuard Spoke**: 10.99.0.2
+- Workload ID: `spiffe://zta.local/workload/os-service`
+
+### Kubernetes Clusters
+- **AWS Cluster (10.20.2.10)**: K3s running UI Pods on port 30080
+- **OS Cluster (10.10.2.10)**: K3s running Backend API Pods on port 30081
+
+## Security Flow
 
 ### Authentication Flow
-
 ```
-┌────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  User  │────►│ AWS Gateway  │────►│   Keycloak   │────►│ Return JWT   │
-│Browser │     │ /auth/token  │     │  Validate    │     │   Token      │
-└────────┘     └──────────────┘     └──────────────┘     └──────────────┘
-    │                                                           │
-    └───────────────────── Store in localStorage ◄──────────────┘
+User → Auth Portal → JWT Token (15-minute TTL)
 ```
 
-### Data Access Flow
-
+### Request Flow with Authorization
 ```
-┌────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  User  │────►│ AWS Envoy    │────►│     OPA      │────►│  OS Envoy    │
-│+JWT    │     │ JWT Validate │     │ Policy Check │     │ mTLS Verify  │
-└────────┘     └──────────────┘     └──────────────┘     └──────┬───────┘
-                                                                │
-┌────────┐     ┌──────────────┐     ┌──────────────┐            │
-│Response│◄────│ AWS Envoy    │◄────│  OS Envoy    │◄───────────┘
-│  JSON  │     │   Return     │     │  Forward     │     Backend API
-└────────┘     └──────────────┘     └──────────────┘     :30091
+1. User sends request with JWT to Auth Portal
+2. Auth Portal forwards to AWS Gateway via WireGuard (10.99.0.1:8080)
+3. Envoy extracts JWT, sends to OPA for policy check
+4. OPA validates JWT signature, claims, permissions
+5. If allowed, Envoy routes to OS Gateway (10.99.0.2:443) with mTLS
+6. OS Gateway terminates mTLS, validates client cert
+7. Request forwarded to Backend Pod
+8. Response returns through same path
 ```
 
-## Component Configuration
-
-### Envoy Proxy (AWS Gateway)
-
-- **Listen**: `:8080` (redirected from `:80` via iptables)
-- **Network Mode**: Host (for iptables NAT)
-- **JWT Provider**: Keycloak (`/realms/zta`)
-- **Upstream Clusters**:
-  - `local_frontend` → K3s :30090
-  - `os_gateway_backend` → 10.99.0.2:443 (mTLS)
-  - `keycloak_cluster` → localhost:8888
-
-### Envoy Proxy (OS Gateway)
-
-- **Listen**: `:443` (TLS)
-- **TLS Mode**: mTLS (require client certificate)
-- **Upstream Clusters**:
-  - `backend_k3s_cluster` → 10.10.2.10:30091
-
-### OPA Policies
-
-```rego
-# Allow public paths
-allow if { http_request.path == "/" }
-allow if { startswith(http_request.path, "/auth/") }
-
-# Require auth for API
-allow if {
-    startswith(http_request.path, "/api/")
-    is_valid_token
-}
+### mTLS Certificate Chain
+```
+SPIRE CA (zta.local)
+    │
+    ├── AWS Gateway SVID (spiffe://zta.local/workload/aws-service)
+    │   TTL: 5 minutes, auto-rotated
+    │
+    └── OS Gateway SVID (spiffe://zta.local/workload/os-service)
+        TTL: 5 minutes, auto-rotated
 ```
 
-### WireGuard Configuration
+## Network Isolation
 
-```ini
-# AWS Gateway (10.99.0.1)
-[Interface]
-Address = 10.99.0.1/24
-ListenPort = 51820
+| Source      | Destination     | Protocol      | Port     | Allowed |
+|-------------|-----------------|---------------|----------|---------|
+| Internet    | Auth Portal     | HTTP          | 80, 8888 |   ✅    |
+| Internet    | AWS/OS Networks | Any           | Any      |   ❌    |
+| Auth Portal | AWS Gateway     | UDP/WireGuard | 51820    |   ✅    |
+| AWS Gateway | OS Gateway      | TCP/mTLS      | 443      |   ✅    |
+| AWS Gateway | SPIRE Server    | TCP           | 8081     |   ✅    |
+| OS Gateway  | SPIRE Server    | TCP           | 8081     |   ✅    |
 
-[Peer]
-AllowedIPs = 10.99.0.2/32, 10.10.2.0/24
-Endpoint = <OS_GATEWAY_PUBLIC_IP>:51820
+## IP Addressing Summary
+
+| Network       | CIDR         | Router               |
+|---------------|--------------|----------------------|
+| DMZ           | 10.50.1.0/24 | router-dmz           |
+| Observability | 10.40.1.0/24 | router-observability |
+| Cloud AWS     | 10.20.2.0/24 | router-dmz           |
+| Cloud OS      | 10.10.2.0/24 | router-dmz           |
+| WireGuard     | 10.99.0.0/24 | (overlay)            |
+
+## Floating IPs (Zero Trust Model)
+
+> ⚠️ **Zero Trust**: ONLY Auth Portal has a public floating IP. All other services are accessed via Auth Portal (SSH tunnels or reverse proxy).
+
+| VM             | Internal IP | Public IP        | Access Method              |
+|----------------|-------------|:----------------:|----------------------------|
+| vm-auth-portal | 10.50.1.10  | ✅ 172.10.10.170 | Direct                     |
+| vm-monitoring  | 10.40.1.10  |        ❌        | SSH tunnel via Auth Portal |
+| vm-identity    | 10.40.1.20  |        ❌        | SSH ProxyCommand           |
+| vm-aws-gateway | 10.20.2.5   |        ❌        | SSH ProxyCommand           |
+| vm-os-gateway  | 10.10.2.5   |        ❌        | SSH ProxyCommand           |
+
+### Accessing Monitoring (Grafana/Prometheus/Jaeger)
+
+```bash
+# SSH tunnel for Grafana (no public IP)
+ssh -L 3000:10.40.1.10:3000 ubuntu@172.10.10.170
+# Open: http://localhost:3000
+
+# SSH tunnel for Prometheus
+ssh -L 9090:10.40.1.10:9090 ubuntu@172.10.10.170
+# Open: http://localhost:9090
+
+# SSH tunnel for Jaeger
+ssh -L 16686:10.40.1.10:16686 ubuntu@172.10.10.170
+# Open: http://localhost:16686
 ```
-
-## Security Considerations
-
-1. **Token Lifetime**: 15 minutes (configurable in .env)
-2. **Certificate Rotation**: Manual (SPIRE auto-rotates SVID every 5 min)
-3. **Network Isolation**: Each cloud in separate VPC
-4. **Secrets Management**: Use .env file (not committed to git)
-
-## Performance Benchmarks
-
-| Metric | Measured Value | Target |
-|--------|---------------|--------|
-| Auth Latency | ~50ms | <500ms |
-| E2E Latency | ~15ms | <100ms |
-| Tunnel Latency | ~0.6ms | <10ms |
-| Throughput | ~20 req/s | >10 req/s |
