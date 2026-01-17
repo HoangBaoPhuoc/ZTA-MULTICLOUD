@@ -236,15 +236,25 @@ curl -s -H "Authorization: Bearer $VIEWER_JWT" http://172.10.10.170:8888/api/aws
 ╠═════════════════════════════════════════════════════════════════╣
 ║  ✅ Test Passed: 40/40 (100%)                                   ║
 ║                                                                 ║
-║  Sections:                                                      ║
-║  • I.   Environment Check         ✓                             ║
-║  • II.  Network Connectivity      ✓                             ║
-║  • III. RBAC & JWT (4 users)      ✓                             ║
-║  • IV.  SPIRE Identity            ✓                             ║
-║  • V.   WireGuard Tunnel          ✓                             ║
-║  • VI.  Gateway Communication     ✓                             ║
-║  • VII. Monitoring Stack          ✓                             ║
-║  • VIII.User Scenario Demo        ✓                             ║
+║  Test Sections (8 categories):                                  ║
+║  ┌─────┬──────────────────────────────────────────────────────┐ ║
+║  │ I   │ Connectivity - Entry points & internal services    ✓ │ ║
+║  │ II  │ Authentication - JWT token & validation            ✓ │ ║
+║  │ III │ RBAC Authorization - 4 user permission matrix      ✓ │ ║
+║  │ IV  │ Monitoring + SPIRE/SVID - Grafana, Loki, Certs     ✓ │ ║
+║  │ V   │ Infrastructure - Docker, Terraform, Network        ✓ │ ║
+║  │ VI  │ End-to-End Flow - Complete auth journey            ✓ │ ║
+║  │ VII │ Performance - Latency & response time              ✓ │ ║
+║  │ VIII│ 4-User Scenario Demo - viewer/aws/full/admin       ✓ │ ║
+║  └─────┴──────────────────────────────────────────────────────┘ ║
+║                                                                 ║
+║  Key Metrics:                                                   ║
+║  • Auth Latency: ~12ms (excellent)                              ║
+║  • Portal Response: ~1ms                                        ║
+║  • JWT TTL: 15 minutes                                          ║
+║  • SVID Rotation: 5 minutes                                     ║
+║  • Prometheus Targets: 3 active                                 ║
+║  • Terraform Resources: 61 managed                              ║
 ╚═════════════════════════════════════════════════════════════════╝
 ```
 
@@ -275,23 +285,21 @@ sudo wg show wg0
 ```
 /etc/zta-multicloud/
 ├── terraform-openstack/
-│   └── main.tf              # Infrastructure as Code
+│   ├── main.tf              # Infrastructure as Code (61 resources)
+│   └── terraform.tfstate    # Terraform state
 ├── ansible-zta/
 │   ├── inventory/
-│   │   └── hosts.ini        # VM inventory
-│   ├── deploy-zta-hub-spoke.yml   # Main deployment
-│   ├── deploy-zta-complete.yml    # SPIRE deployment
-│   ├── deploy-auth-portal.yml     # Auth Portal only
-│   ├── deploy-jwt-gateway.yml     # JWT Gateway config
-│   └── site.yml                   # Full site config
+│   │   ├── hosts.ini        # VM inventory (production)
+│   │   └── hosts.ini.example # Example inventory template
+│   ├── site.yml             # Main deployment playbook
+│   ├── ansible.cfg          # Ansible configuration
+│   └── roles/               # Ansible roles
 ├── docs/
-│   ├── architecture.md      # Detailed architecture
-│   └── ssh-reference.md     # SSH quick reference
+│   ├── architecture.md      # Detailed ZTA architecture
+│   └── ssh-reference.md     # SSH tunnel quick reference
 ├── logs/                    # Deployment logs
 ├── zta-full-deploy.sh       # All-in-one deploy script
-├── zta-evaluation-test.sh   # E2E test script (40 tests)
-├── zta-demo-scenario.sh     # 4-user RBAC demo
-├── ssh-helper.sh            # Interactive SSH menu
+├── zta-evaluation-test.sh   # E2E test script (40 tests, 8 sections)
 └── cleanup.sh               # Cleanup script
 ```
 
@@ -307,16 +315,25 @@ sudo wg show wg0
 | Auth Portal | admin     | admin123  | Full access    |
 | Grafana     | admin     | admin     | Via SSH tunnel |
 
-### Access Monitoring (No Public IP)
+### Access Monitoring (No Public IP - Zero Trust)
 
 ```bash
-# SSH tunnel for Grafana
-ssh -L 3000:10.40.1.10:3000 -i ~/.ssh/id_rsa_zerotrust ubuntu@172.10.10.170
-# Then open: http://localhost:3000
+# All monitoring services require SSH tunnel through Auth Portal
 
-# SSH tunnel for Prometheus
+# Grafana (Dashboards)
+ssh -L 3000:10.40.1.10:3000 -i ~/.ssh/id_rsa_zerotrust ubuntu@172.10.10.170
+# Open: http://localhost:3000 (admin/admin)
+
+# Prometheus (Metrics - 3 active targets)
 ssh -L 9090:10.40.1.10:9090 -i ~/.ssh/id_rsa_zerotrust ubuntu@172.10.10.170
-# Then open: http://localhost:9090
+# Open: http://localhost:9090
+
+# Jaeger (Distributed Tracing)
+ssh -L 16686:10.40.1.10:16686 -i ~/.ssh/id_rsa_zerotrust ubuntu@172.10.10.170
+# Open: http://localhost:16686
+
+# Loki (Log Aggregation) - accessed via Grafana datasource
+# Port 3100 internal only
 ```
 
 ---
@@ -334,6 +351,8 @@ ssh -L 9090:10.40.1.10:9090 -i ~/.ssh/id_rsa_zerotrust ubuntu@172.10.10.170
 | 51820/UDP | WireGuard      | All gateways   |
 | 3000      | Grafana        | vm-monitoring  |
 | 9090      | Prometheus     | vm-monitoring  |
+| 3100      | Loki           | vm-monitoring  |
+| 16686     | Jaeger         | vm-monitoring  |
 
 ---
 
